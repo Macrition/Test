@@ -19,6 +19,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
+      - name: Fetch pinned release asset (runner-side, token never reaches host)
+        if: ${{ github.event.client_payload.fetch_url != '' }}
+        env:
+          GH_PAT: ${{ secrets.OPS_GH_PAT }}
+          FETCH_URL: ${{ github.event.client_payload.fetch_url }}
+          FETCH_SHA: ${{ github.event.client_payload.fetch_sha256 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$FETCH_URL" ]; then echo "no fetch requested"; exit 0; fi
+          if [ -z "$GH_PAT" ]; then echo "OPS_GH_PAT secret missing"; exit 5; fi
+          curl -sSL --max-time 300 -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/octet-stream" -o payload.bin "$FETCH_URL"
+          echo "$FETCH_SHA  payload.bin" | sha256sum -c -
+          echo "fetched+verified $(stat -c%s payload.bin) bytes"
       - name: Execute batch on managed host
         env:
           SSH_PRIV: ${{ secrets.OPS_SSH_KEY }}
@@ -26,6 +40,7 @@ jobs:
           SSH_PORT: ${{ secrets.OPS_PORT }}
           SSH_USER: ${{ secrets.OPS_USER }}
           HOST_FP: ${{ secrets.OPS_HOST_FP }}
+          FETCH_DEST: ${{ github.event.client_payload.fetch_dest }}
           BATCH_B64: ${{ github.event.client_payload.batch_b64 }}
         run: |
           set -euo pipefail
@@ -38,6 +53,14 @@ jobs:
           [ -s scanned ] || { echo "host unreachable"; exit 4; }
           ssh-keygen -lf scanned | grep -qF "$HOST_FP" || { echo "HOST KEY MISMATCH - ABORT"; exit 3; }
           cp scanned ~/.ssh/known_hosts
+          if [ -f payload.bin ] && [ -n "${FETCH_DEST:-}" ]; then
+            scp -P "$SSH_PORT" -i ~/.ssh/ops_key -o IdentitiesOnly=yes \
+              -o BatchMode=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile=~/.ssh/known_hosts \
+              payload.bin "$SSH_USER@$SSH_HOST:$FETCH_DEST"
+            echo "payload uploaded: $(stat -c%s payload.bin) bytes -> host"
+          fi
+          rm -f payload.bin
           set +e
           ssh -p "$SSH_PORT" -i ~/.ssh/ops_key -o IdentitiesOnly=yes \
             -o BatchMode=yes -o StrictHostKeyChecking=yes \
