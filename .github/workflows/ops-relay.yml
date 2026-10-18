@@ -1,0 +1,69 @@
+name: Ops Relay
+# Generic SSH batch relay for an authorized deployment operation.
+# All connection parameters (host, port, user, key, host-key fingerprint and
+# artifact passphrase) are repository SECRETS - none are stored in this file.
+# The batch to execute arrives via repository_dispatch client_payload, which
+# requires write access to trigger. Output is encrypted before it becomes an
+# artifact; the live log shows only the exit status. Fork PRs receive no
+# secrets; only users with write access can trigger or modify this workflow.
+on:
+  repository_dispatch:
+    types: [ops-exec]
+permissions:
+  contents: read
+concurrency:
+  group: ops-relay
+  cancel-in-progress: false
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Execute batch on managed host
+        env:
+          SSH_PRIV: ${{ secrets.OPS_SSH_KEY }}
+          SSH_HOST: ${{ secrets.OPS_HOST }}
+          SSH_PORT: ${{ secrets.OPS_PORT }}
+          SSH_USER: ${{ secrets.OPS_USER }}
+          HOST_FP: ${{ secrets.OPS_HOST_FP }}
+          BATCH_B64: ${{ github.event.client_payload.batch_b64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BATCH_B64" ]; then echo "no batch supplied"; exit 2; fi
+          echo "$BATCH_B64" | base64 -d > batch.sh
+          bash -n batch.sh || { echo "batch syntax invalid"; exit 2; }
+          mkdir -p ~/.ssh; chmod 700 ~/.ssh
+          printf '%s' "$SSH_PRIV" > ~/.ssh/ops_key; chmod 600 ~/.ssh/ops_key
+          ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" > scanned 2>/dev/null
+          [ -s scanned ] || { echo "host unreachable"; exit 4; }
+          ssh-keygen -lf scanned | grep -qF "$HOST_FP" || { echo "HOST KEY MISMATCH - ABORT"; exit 3; }
+          cp scanned ~/.ssh/known_hosts
+          set +e
+          ssh -p "$SSH_PORT" -i ~/.ssh/ops_key -o IdentitiesOnly=yes \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile=~/.ssh/known_hosts \
+            -o ConnectTimeout=20 -o ServerAliveInterval=30 \
+            "$SSH_USER@$SSH_HOST" 'bash -s' < batch.sh > out.log 2>&1
+          rc=$?
+          set -e
+          rm -f ~/.ssh/ops_key batch.sh
+          echo "batch exit=$rc"
+          exit $rc
+      - name: Encrypt output
+        if: always()
+        env:
+          OUT_PASS: ${{ secrets.OPS_OUT_PASS }}
+        run: |
+          set -euo pipefail
+          [ -f out.log ] || echo "(no output produced)" > out.log
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -in out.log -out out.log.enc -pass env:OUT_PASS
+          rm -f out.log
+      - name: Upload encrypted artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-out-${{ github.run_id }}
+          path: out.log.enc
+          retention-days: 1
+          if-no-files-found: error
