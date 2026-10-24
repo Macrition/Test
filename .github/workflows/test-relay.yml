@@ -206,6 +206,22 @@ jobs:
               print("VERDICT: RED"); sys.exit(1)
           print("VERDICT: GREEN")' "$SUMMARY"
 
+      - name: Diagnose tracked-tree state (post-wall)
+        if: always() && contains(github.event.inputs.suites, 'wall')
+        working-directory: src
+        run: |
+          set -uo pipefail
+          {
+            echo "== git status --porcelain --untracked-files=no =="
+            git status --porcelain --untracked-files=no
+            echo "== git diff --stat HEAD =="
+            git diff --stat HEAD | tail -20
+            echo "== git diff HEAD (max 200 lines) =="
+            git diff HEAD | head -200
+          } > detail-gitstatus.log 2>&1 || true
+          DIRTY_N=$(grep -c '^ M\|^M\|^ D\|^D\|^ T\|^T' detail-gitstatus.log || true)
+          echo "post-wall tracked-tree state: ${DIRTY_N} dirty entries (detail encrypted)"
+
       - name: Encrypt detailed evidence
         if: always()
         working-directory: src
@@ -218,6 +234,7 @@ jobs:
           [ -f detail-hygiene.log ] || : > detail-hygiene.log
           [ -f detail-wall.log ] || : > detail-wall.log
           [ -f wall-summary.json ] || : > wall-summary.json
+          [ -f detail-gitstatus.log ] || : > detail-gitstatus.log
           if [ -f "$GITHUB_WORKSPACE/hosted-wall.junit.xml" ] || [ -f "${RUNNER_TEMP:-/tmp}/hosted-wall.junit.xml" ]; then
             cp "${RUNNER_TEMP:-/tmp}/hosted-wall.junit.xml" wall.junit.xml 2>/dev/null \
               || cp "$GITHUB_WORKSPACE/hosted-wall.junit.xml" wall.junit.xml 2>/dev/null \
@@ -225,7 +242,7 @@ jobs:
           else
             : > wall.junit.xml
           fi
-          tar czf evidence.tgz detail-install.log detail-boot.log detail-hygiene.log detail-wall.log wall-summary.json wall.junit.xml
+          tar czf evidence.tgz detail-install.log detail-boot.log detail-hygiene.log detail-wall.log detail-gitstatus.log wall-summary.json wall.junit.xml
           openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in evidence.tgz -out "$GITHUB_WORKSPACE/evidence.tgz.enc" -pass env:RELAY_PASS
           rm -f evidence.tgz detail-*.log wall-summary.json wall.junit.xml
 
