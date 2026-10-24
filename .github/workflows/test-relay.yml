@@ -51,7 +51,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 110
     env:
       APP_DIR: src/workspace/macrition-laravel
     steps:
@@ -148,45 +148,58 @@ jobs:
           fi
           echo "tracked tree clean at $TARGET_SHA"
 
-      - name: Full PHPUnit wall (output private, aggregates only)
+      - name: Full PHPUnit wall (the e150 slice discipline, hosted)
         if: contains(github.event.inputs.suites, 'wall')
         working-directory: ${{ env.APP_DIR }}
         env:
-          JUNIT_PATH: ${{ runner.temp }}/hosted-wall.junit.xml
+          JUNIT_DIR: ${{ runner.temp }}/hosted-junit
         run: |
-          set -euo pipefail
-          mkdir -p storage/ci
-          rc=0
-          # (v2) the JUnit log goes OUTSIDE the checkout: at the wall-of-record
-          # tree storage/ci/wall.junit.xml is a TRACKED receipt, and phpunit
-          # touches the log file at run start — writing it inside the tree
-          # dirties the tracked surface and fails the S291 builder tests
-          # (the run-1 finding; the same collision is latent in the private
-          # repo's certified lane — filed for the lanes).
-          php artisan test --no-coverage --log-junit "$JUNIT_PATH" > ../../detail-wall.log 2>&1 || rc=$?
-          python3 - "$JUNIT_PATH" <<'EOF' > ../../wall-summary.json
-          import sys
-          import xml.etree.ElementTree as ET
-          root = ET.parse(sys.argv[1]).getroot()
-          tests = assertions = failures = errors = skipped = 0
-          classes = 0
-          # (v2) aggregate ONLY the direct children of the root — the
-          # top-level suites already carry the complete totals; walking
-          # nested suites double-counts (the run-1 parser bug).
-          tops = [root] if root.tag == 'testsuite' else list(root.findall('testsuite'))
-          for ts in tops:
-              tests += int(ts.get('tests', 0) or 0)
-              assertions += int(ts.get('assertions', 0) or 0)
-              failures += int(ts.get('failures', 0) or 0)
-              errors += int(ts.get('errors', 0) or 0)
-              skipped += int(ts.get('skipped', 0) or 0)
-              classes += len(ts.findall('testsuite'))
-          import json
-          print(json.dumps({'test_classes': classes, 'tests': tests, 'assertions': assertions,
-                            'failures': failures, 'errors': errors, 'skipped': skipped}))
-          EOF
+          set -uo pipefail
+          mkdir -p "$JUNIT_DIR"
+          cat > /tmp/parse_junit.py <<'PYEOF'
+          import sys, xml.etree.ElementTree as ET
+          try:
+              root = ET.parse(sys.argv[1]).getroot()
+              tops = [root] if root.tag == 'testsuite' else list(root.findall('testsuite'))
+              t = a = f = e = s = 0
+              for ts in tops:
+                  t += int(ts.get('tests', 0) or 0)
+                  a += int(ts.get('assertions', 0) or 0)
+                  f += int(ts.get('failures', 0) or 0)
+                  e += int(ts.get('errors', 0) or 0)
+                  s += int(ts.get('skipped', 0) or 0)
+              print(t, a, f, e, s)
+          except Exception:
+              print(0, 0, 1, 0, 0)
+          PYEOF
+          T_TOTAL=0; A_TOTAL=0; F_FILES=0; FAILS=0; ERRS=0; SKIPS=0; RC=0
+          : > ../../detail-wall.log
+          # the e150 channel law (v4): per-file slices, the migration-manifest
+          # side-effect restored at each boundary. LegacyImporterTest
+          # regenerates the tracked database/migration-manifest.json with a
+          # fresh generated_at; left unrestored it dirties the tracked tree and
+          # fails the S291 builder-execution tests later in the suite (the
+          # known channel caveat, honored per-slice by the e150 discipline).
+          for SUITE_DIR in tests/Feature tests/Unit; do
+            for FILE in $(ls "$SUITE_DIR"/*.php | sort); do
+              BASE=$(basename "$FILE" .php)
+              OUT=$(timeout 600 php vendor/bin/phpunit --no-coverage --log-junit "$JUNIT_DIR/$BASE.junit.xml" "$FILE" 2>&1)
+              PRC=$?
+              echo "$OUT" >> ../../detail-wall.log
+              LINE=$(python3 /tmp/parse_junit.py "$JUNIT_DIR/$BASE.junit.xml")
+              read -r NT NA NF NE NS <<< "$LINE"
+              T_TOTAL=$((T_TOTAL+NT)); A_TOTAL=$((A_TOTAL+NA)); F_FILES=$((F_FILES+1))
+              FAILS=$((FAILS+NF)); ERRS=$((ERRS+NE)); SKIPS=$((SKIPS+NS))
+              if [ "$PRC" -ne 0 ]; then RC=1; echo "SLICE-FAIL: $BASE (rc=$PRC; $NT tests / $NA assertions / $NF failures / $NE errors)" >> ../../detail-wall.log; fi
+              git -C "$GITHUB_WORKSPACE/src" checkout -- workspace/macrition-laravel/database/migration-manifest.json 2>>../../detail-wall.log || true
+            done
+          done
+          cat > ../../wall-summary.json <<JSONEOF
+          {"test_classes": $F_FILES, "tests": $T_TOTAL, "assertions": $A_TOTAL, "failures": $FAILS, "errors": $ERRS, "skipped": $SKIPS}
+          JSONEOF
+          echo "driver totals: files=$F_FILES tests=$T_TOTAL assertions=$A_TOTAL failures=$FAILS errors=$ERRS skipped=$SKIPS" >> ../../detail-wall.log
           cat ../../wall-summary.json
-          exit $rc
+          exit $RC
 
       - name: Wall verdict (public aggregate only)
         if: always() && contains(github.event.inputs.suites, 'wall')
@@ -235,16 +248,12 @@ jobs:
           [ -f detail-wall.log ] || : > detail-wall.log
           [ -f wall-summary.json ] || : > wall-summary.json
           [ -f detail-gitstatus.log ] || : > detail-gitstatus.log
-          if [ -f "$GITHUB_WORKSPACE/hosted-wall.junit.xml" ] || [ -f "${RUNNER_TEMP:-/tmp}/hosted-wall.junit.xml" ]; then
-            cp "${RUNNER_TEMP:-/tmp}/hosted-wall.junit.xml" wall.junit.xml 2>/dev/null \
-              || cp "$GITHUB_WORKSPACE/hosted-wall.junit.xml" wall.junit.xml 2>/dev/null \
-              || : > wall.junit.xml
-          else
-            : > wall.junit.xml
+          if [ -d "${RUNNER_TEMP:-/tmp}/hosted-junit" ]; then
+            mkdir -p junit-receipts && cp "${RUNNER_TEMP:-/tmp}/hosted-junit"/*.junit.xml junit-receipts/ 2>/dev/null || true
           fi
-          tar czf evidence.tgz detail-install.log detail-boot.log detail-hygiene.log detail-wall.log detail-gitstatus.log wall-summary.json wall.junit.xml
+          tar czf evidence.tgz detail-install.log detail-boot.log detail-hygiene.log detail-wall.log detail-gitstatus.log wall-summary.json junit-receipts
           openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in evidence.tgz -out "$GITHUB_WORKSPACE/evidence.tgz.enc" -pass env:RELAY_PASS
-          rm -f evidence.tgz detail-*.log wall-summary.json wall.junit.xml
+          rm -f evidence.tgz detail-*.log wall-summary.json; rm -rf junit-receipts
 
       - name: Upload encrypted artifact
         if: always()
