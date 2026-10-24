@@ -155,6 +155,15 @@ jobs:
           JUNIT_DIR: ${{ runner.temp }}/hosted-junit
         run: |
           set -uo pipefail
+          # (relay v5, op-66 composition finding) the runner invokes this
+          # script with bash -e; the slice loop's `OUT=$(...)` command
+          # substitution then ABORTS the whole driver at the FIRST failing
+          # slice - before the guarded PRC=$? capture - so the channel could
+          # never report a red PRODUCT verdict (it died with "no summary
+          # produced" instead). set +e restores the author's intended
+          # semantics: the guards handle slice failures, the exit $RC at
+          # the end carries the verdict.
+          set +e
           mkdir -p "$JUNIT_DIR"
           cat > /tmp/parse_junit.py <<'PYEOF'
           import sys, xml.etree.ElementTree as ET
