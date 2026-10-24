@@ -136,38 +136,53 @@ jobs:
           fi
           exit $rc
 
+      - name: Verify clean tracked tree (the S291 builder precondition)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          DIRTY=$(git status --porcelain --untracked-files=no)
+          if [ -n "$DIRTY" ]; then
+            echo "ERR: tracked tree dirty before the wall (the S291 builder tests require clean):"
+            echo "$DIRTY" | sed 's/^/  /' | head -10
+            exit 3
+          fi
+          echo "tracked tree clean at $TARGET_SHA"
+
       - name: Full PHPUnit wall (output private, aggregates only)
         if: contains(github.event.inputs.suites, 'wall')
         working-directory: ${{ env.APP_DIR }}
+        env:
+          JUNIT_PATH: ${{ runner.temp }}/hosted-wall.junit.xml
         run: |
           set -euo pipefail
           mkdir -p storage/ci
           rc=0
-          php artisan test --no-coverage --log-junit storage/ci/wall.junit.xml > ../../detail-wall.log 2>&1 || rc=$?
-          python3 - <<'EOF' > ../../wall-summary.json
+          # (v2) the JUnit log goes OUTSIDE the checkout: at the wall-of-record
+          # tree storage/ci/wall.junit.xml is a TRACKED receipt, and phpunit
+          # touches the log file at run start — writing it inside the tree
+          # dirties the tracked surface and fails the S291 builder tests
+          # (the run-1 finding; the same collision is latent in the private
+          # repo's certified lane — filed for the lanes).
+          php artisan test --no-coverage --log-junit "$JUNIT_PATH" > ../../detail-wall.log 2>&1 || rc=$?
+          python3 - "$JUNIT_PATH" <<'EOF' > ../../wall-summary.json
+          import sys
           import xml.etree.ElementTree as ET
-          root = ET.parse('storage/ci/wall.junit.xml').getroot()
-          files = set()
+          root = ET.parse(sys.argv[1]).getroot()
           tests = assertions = failures = errors = skipped = 0
-          def walk(ts):
-              global tests, assertions, failures, errors, skipped
-              children = list(ts.findall('testsuite'))
-              for ts2 in children:
-                  walk(ts2)
-              if not children:
-                  files.add(ts.get('name', '?'))
+          classes = 0
+          # (v2) aggregate ONLY the direct children of the root — the
+          # top-level suites already carry the complete totals; walking
+          # nested suites double-counts (the run-1 parser bug).
+          tops = [root] if root.tag == 'testsuite' else list(root.findall('testsuite'))
+          for ts in tops:
               tests += int(ts.get('tests', 0) or 0)
               assertions += int(ts.get('assertions', 0) or 0)
               failures += int(ts.get('failures', 0) or 0)
               errors += int(ts.get('errors', 0) or 0)
               skipped += int(ts.get('skipped', 0) or 0)
-          if root.tag == 'testsuite':
-              walk(root)
-          else:
-              for ts2 in root.findall('testsuite'):
-                  walk(ts2)
+              classes += len(ts.findall('testsuite'))
           import json
-          print(json.dumps({'test_classes': len(files), 'tests': tests, 'assertions': assertions,
+          print(json.dumps({'test_classes': classes, 'tests': tests, 'assertions': assertions,
                             'failures': failures, 'errors': errors, 'skipped': skipped}))
           EOF
           cat ../../wall-summary.json
@@ -203,8 +218,10 @@ jobs:
           [ -f detail-hygiene.log ] || : > detail-hygiene.log
           [ -f detail-wall.log ] || : > detail-wall.log
           [ -f wall-summary.json ] || : > wall-summary.json
-          if [ -f workspace/macrition-laravel/storage/ci/wall.junit.xml ]; then
-            cp workspace/macrition-laravel/storage/ci/wall.junit.xml wall.junit.xml
+          if [ -f "$GITHUB_WORKSPACE/hosted-wall.junit.xml" ] || [ -f "${RUNNER_TEMP:-/tmp}/hosted-wall.junit.xml" ]; then
+            cp "${RUNNER_TEMP:-/tmp}/hosted-wall.junit.xml" wall.junit.xml 2>/dev/null \
+              || cp "$GITHUB_WORKSPACE/hosted-wall.junit.xml" wall.junit.xml 2>/dev/null \
+              || : > wall.junit.xml
           else
             : > wall.junit.xml
           fi
