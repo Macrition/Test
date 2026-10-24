@@ -1,0 +1,226 @@
+name: Test Relay
+
+# Public-repo automated test channel for the private Macrition system
+# (user-directed 2026-10-24; private-repo Actions minutes are exhausted —
+# see the diagnosis in the private repo coordination channel, task-292).
+#
+# WHAT IT DOES: runs the full PHPUnit wall (and the tracked-surface
+# hygiene scan) at an EXACT private-repo SHA, on free public-repo
+# runners.
+#
+# NO-LEAK DESIGN (all three rules enforced):
+#   1. The private source is fetched to the EPHEMERAL runner disk only
+#      (actions/checkout with a token secret, persist-credentials:
+#      false). Nothing is ever committed to this public repo.
+#   2. The PUBLIC run log carries ONLY: the tested SHA, suite verdicts,
+#      and aggregate counts. Every step whose output could embed
+#      private-derived metadata (composer, artisan, phpunit detail) is
+#      redirected into detail logs that are never printed.
+#   3. Detailed evidence (full logs + JUnit) is AES-256-encrypted with a
+#      passphrase secret before upload; the artifact is decryptable
+#      only by the secret holder.
+#
+# TRIGGER SURFACE: workflow_dispatch ONLY — collaborators only (forks
+# and anonymous users can neither dispatch nor read secrets).
+#
+# NOTE (hardening recommendation, task-292): the checkout reuses the
+# existing OPS_GH_PAT secret (least new surface). A dedicated READ-ONLY
+# deploy key on the private repo would be narrower; the private-repo
+# PAT available to agents lacks Administration:write to create it, so
+# that upgrade is left to the account owner.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Exact 40-hex commit SHA to test (default: integration/product-reconstruction head)'
+        required: false
+        default: ''
+      suites:
+        description: 'wall | hygiene | wall,hygiene'
+        required: false
+        default: 'wall,hygiene'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-relay
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      APP_DIR: src/workspace/macrition-laravel
+    steps:
+      - name: Resolve target SHA
+        env:
+          GH_PAT: ${{ secrets.OPS_GH_PAT }}
+          SHA_INPUT: ${{ github.event.inputs.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SHA_INPUT" ]; then
+            echo "$SHA_INPUT" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: sha must be 40-hex"; exit 2; }
+            echo "TARGET_SHA=$SHA_INPUT" >> "$GITHUB_ENV"
+          else
+            HEAD=$(curl -s -H "Authorization: Bearer $GH_PAT" \
+              "https://api.github.com/repos/Macrition/Storing-System-Macrition/branches/integration/product-reconstruction" \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["commit"]["sha"])')
+            echo "$HEAD" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: head resolve failed"; exit 2; }
+            echo "TARGET_SHA=$HEAD" >> "$GITHUB_ENV"
+          fi
+
+      - name: Checkout private source at exact SHA (ephemeral, never persisted here)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Macrition/Storing-System-Macrition
+          ref: ${{ env.TARGET_SHA }}
+          token: ${{ secrets.OPS_GH_PAT }}
+          persist-credentials: false
+          path: src
+
+      - name: Setup PHP 8.4 (mirrors the certified lane pin)
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
+        with:
+          php-version: '8.4'
+          extensions: mbstring, curl, openssl, sodium, sqlite3, pdo_sqlite, dom, fileinfo, gd, gmp
+          coverage: none
+
+      - name: Install exact dependencies (output private)
+        working-directory: ${{ env.APP_DIR }}
+        run: composer install --no-interaction --no-progress --prefer-dist --quiet > ../../detail-install.log 2>&1
+
+      - name: Prepare isolated SQLite runtime (output private)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          {
+            cp .env.example .env
+            touch database/database.sqlite
+            php artisan key:generate --force
+            php artisan migrate --seed --force
+          } > ../../detail-boot.log 2>&1
+
+      - name: Hygiene scan (tracked-surface secret gate at the exact SHA)
+        if: contains(github.event.inputs.suites, 'hygiene')
+        working-directory: src
+        run: |
+          set -euo pipefail
+          rc=0
+          {
+            patterns=(
+              'SSH Key Pair Private.zip'
+              'scripts/ssh-deploy/browser-probe.json'
+              'scripts/ssh-deploy/probe-user.json'
+              'scripts/ssh-deploy/probe-jar.json'
+              'scripts/ssh-deploy/keys/*'
+            )
+            hits=0
+            for pat in "${patterns[@]}"; do
+              while IFS= read -r f; do
+                echo "FORBIDDEN: ${f} (pattern: ${pat})"
+                hits=$((hits + 1))
+              done < <(git ls-files -- "$pat")
+            done
+            keyhits=$(git ls-files -z -- '*.pem' '*.key' 'scripts/ssh-deploy/keys/*' 2>/dev/null | xargs -0 -r grep -l "PRIVATE KEY" 2>/dev/null | wc -l || true)
+            echo "hygiene forbidden-file hits: ${hits}"
+            echo "hygiene private-key-material hits: ${keyhits}"
+            test "$hits" -eq 0 -a "${keyhits:-0}" -eq 0
+          } > detail-hygiene.log 2>&1 || rc=$?
+          if [ $rc -eq 0 ]; then
+            echo "HYGIENE: OK (tracked surface clean at $TARGET_SHA)"
+          else
+            echo "HYGIENE: FAILED (see encrypted artifact; counts in detail log)"
+          fi
+          exit $rc
+
+      - name: Full PHPUnit wall (output private, aggregates only)
+        if: contains(github.event.inputs.suites, 'wall')
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          mkdir -p storage/ci
+          rc=0
+          php artisan test --no-coverage --log-junit storage/ci/wall.junit.xml > ../../detail-wall.log 2>&1 || rc=$?
+          python3 - <<'EOF' > ../../wall-summary.json
+          import xml.etree.ElementTree as ET
+          root = ET.parse('storage/ci/wall.junit.xml').getroot()
+          files = set()
+          tests = assertions = failures = errors = skipped = 0
+          def walk(ts):
+              global tests, assertions, failures, errors, skipped
+              children = list(ts.findall('testsuite'))
+              for ts2 in children:
+                  walk(ts2)
+              if not children:
+                  files.add(ts.get('name', '?'))
+              tests += int(ts.get('tests', 0) or 0)
+              assertions += int(ts.get('assertions', 0) or 0)
+              failures += int(ts.get('failures', 0) or 0)
+              errors += int(ts.get('errors', 0) or 0)
+              skipped += int(ts.get('skipped', 0) or 0)
+          if root.tag == 'testsuite':
+              walk(root)
+          else:
+              for ts2 in root.findall('testsuite'):
+                  walk(ts2)
+          import json
+          print(json.dumps({'test_classes': len(files), 'tests': tests, 'assertions': assertions,
+                            'failures': failures, 'errors': errors, 'skipped': skipped}))
+          EOF
+          cat ../../wall-summary.json
+          exit $rc
+
+      - name: Wall verdict (public aggregate only)
+        if: always() && contains(github.event.inputs.suites, 'wall')
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          if [ ! -f ../../wall-summary.json ] || [ ! -s ../../wall-summary.json ]; then
+            echo "VERDICT: RED (no summary produced — see encrypted artifact)"
+            exit 1
+          fi
+          SUMMARY=$(cat ../../wall-summary.json)
+          echo "WALL at $TARGET_SHA: $SUMMARY"
+          python3 -c '
+          import json, sys
+          s = json.loads(sys.argv[1])
+          if s["failures"] or s["errors"]:
+              print("VERDICT: RED"); sys.exit(1)
+          print("VERDICT: GREEN")' "$SUMMARY"
+
+      - name: Encrypt detailed evidence
+        if: always()
+        working-directory: src
+        env:
+          RELAY_PASS: ${{ secrets.TEST_RELAY_PASS }}
+        run: |
+          set -euo pipefail
+          [ -f detail-install.log ] || : > detail-install.log
+          [ -f detail-boot.log ] || : > detail-boot.log
+          [ -f detail-hygiene.log ] || : > detail-hygiene.log
+          [ -f detail-wall.log ] || : > detail-wall.log
+          [ -f wall-summary.json ] || : > wall-summary.json
+          if [ -f workspace/macrition-laravel/storage/ci/wall.junit.xml ]; then
+            cp workspace/macrition-laravel/storage/ci/wall.junit.xml wall.junit.xml
+          else
+            : > wall.junit.xml
+          fi
+          tar czf evidence.tgz detail-install.log detail-boot.log detail-hygiene.log detail-wall.log wall-summary.json wall.junit.xml
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in evidence.tgz -out "$GITHUB_WORKSPACE/evidence.tgz.enc" -pass env:RELAY_PASS
+          rm -f evidence.tgz detail-*.log wall-summary.json wall.junit.xml
+
+      - name: Upload encrypted artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: test-relay-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: evidence.tgz.enc
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Cleanup runner source (defense in depth)
+        if: always()
+        run: rm -rf src
