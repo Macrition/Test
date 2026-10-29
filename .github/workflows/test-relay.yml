@@ -33,7 +33,7 @@ on:
   workflow_dispatch:
     inputs:
       sha:
-        description: 'Exact 40-hex commit SHA to test (default: integration/product-reconstruction head)'
+        description: 'Exact 40-hex commit SHA to test (default: main head — the OP-74 audit target lineage)'
         required: false
         default: ''
       suites:
@@ -63,8 +63,11 @@ jobs:
             echo "$SHA_INPUT" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: sha must be 40-hex"; exit 2; }
             echo "TARGET_SHA=$SHA_INPUT" >> "$GITHUB_ENV"
           else
+            # relay v7 (2026-10-29): the default lineage of record is MAIN
+            # (the OP-74 audit target) — integration/product-reconstruction
+            # is 462 commits behind and is no longer the default target.
             HEAD=$(curl -s -H "Authorization: Bearer $GH_PAT" \
-              "https://api.github.com/repos/Macrition/Storing-System-Macrition/branches/integration/product-reconstruction" \
+              "https://api.github.com/repos/Macrition/Storing-System-Macrition/branches/main" \
               | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["commit"]["sha"])')
             echo "$HEAD" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: head resolve failed"; exit 2; }
             echo "TARGET_SHA=$HEAD" >> "$GITHUB_ENV"
@@ -277,8 +280,13 @@ jobs:
           [ -f detail-wall.log ] || : > detail-wall.log
           [ -f wall-summary.json ] || : > wall-summary.json
           [ -f detail-gitstatus.log ] || : > detail-gitstatus.log
+          # relay v7 (2026-10-29, run 40793161816 finding): junit-receipts
+          # must exist EVEN when the wall never ran (boot RED / hygiene-only
+          # dispatch) — the guard-only creation made tar exit 2, the upload
+          # never happened, and every RED was undiagnosable (no artifact).
+          mkdir -p junit-receipts
           if [ -d "${RUNNER_TEMP:-/tmp}/hosted-junit" ]; then
-            mkdir -p junit-receipts && cp "${RUNNER_TEMP:-/tmp}/hosted-junit"/*.junit.xml junit-receipts/ 2>/dev/null || true
+            cp "${RUNNER_TEMP:-/tmp}/hosted-junit"/*.junit.xml junit-receipts/ 2>/dev/null || true
           fi
           tar czf evidence.tgz detail-install.log detail-boot.log detail-hygiene.log detail-wall.log detail-gitstatus.log wall-summary.json junit-receipts
           openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in evidence.tgz -out "$GITHUB_WORKSPACE/evidence.tgz.enc" -pass env:RELAY_PASS
