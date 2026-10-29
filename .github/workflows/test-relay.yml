@@ -52,8 +52,6 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 110
-    env:
-      APP_DIR: src/workspace/macrition-laravel
     steps:
       - name: Resolve target SHA
         env:
@@ -80,6 +78,28 @@ jobs:
           token: ${{ secrets.OPS_GH_PAT }}
           persist-credentials: false
           path: src
+
+      # relay v6 (2026-10-29): the channel's lineages moved to the flat
+      # root layout. The app dir and the tracked manifest receipt are now
+      # resolved from the checked-out tree itself (fail-closed on unknown
+      # layout) so one workflow walls any lineage: root app, or the older
+      # nested app under workspace/.
+      - name: Resolve app layout (root or nested)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          if [ -f composer.json ] && [ -d tests ] && [ -f phpunit.xml ]; then
+            echo "APP_DIR=src"                                  >> "$GITHUB_ENV"
+            echo "MANIFEST_REL=database/migration-manifest.json" >> "$GITHUB_ENV"
+            echo "layout: root (application at repository root)"
+          elif [ -f workspace/macrition-laravel/composer.json ]; then
+            echo "APP_DIR=src/workspace/macrition-laravel"                                  >> "$GITHUB_ENV"
+            echo "MANIFEST_REL=workspace/macrition-laravel/database/migration-manifest.json" >> "$GITHUB_ENV"
+            echo "layout: nested (application under workspace/)"
+          else
+            echo "ERR: unknown layout - neither root app nor nested app found at $TARGET_SHA"
+            exit 2
+          fi
 
       - name: Setup PHP 8.4 (mirrors the certified lane pin)
         uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
@@ -200,7 +220,7 @@ jobs:
               T_TOTAL=$((T_TOTAL+NT)); A_TOTAL=$((A_TOTAL+NA)); F_FILES=$((F_FILES+1))
               FAILS=$((FAILS+NF)); ERRS=$((ERRS+NE)); SKIPS=$((SKIPS+NS))
               if [ "$PRC" -ne 0 ]; then RC=1; echo "SLICE-FAIL: $BASE (rc=$PRC; $NT tests / $NA assertions / $NF failures / $NE errors)" >> ../../detail-wall.log; fi
-              git -C "$GITHUB_WORKSPACE/src" checkout -- workspace/macrition-laravel/database/migration-manifest.json 2>>../../detail-wall.log || true
+              git -C "$GITHUB_WORKSPACE/src" checkout -- "$MANIFEST_REL" 2>>../../detail-wall.log || true
             done
           done
           cat > ../../wall-summary.json <<JSONEOF
