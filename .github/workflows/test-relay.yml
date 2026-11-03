@@ -59,19 +59,35 @@ jobs:
           SHA_INPUT: ${{ github.event.inputs.sha }}
         run: |
           set -euo pipefail
+          RESOLVE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GH_PAT" \
+            "https://api.github.com/repos/Macrition/Storing-System-Macrition/commits/main")
+          [ "$RESOLVE" = "200" ] || { echo "ERR: OPS_GH_PAT cannot read the private repo (HTTP $RESOLVE) — the secret is expired/revoked or lacks Contents:read. Update the secret; do not debug the wall."; exit 2; }
+          resolve_ref () { # resolve_ref <ref-or-sha> -> prints 40-hex or fails
+            curl -s -H "Authorization: Bearer $GH_PAT" \
+              "https://api.github.com/repos/Macrition/Storing-System-Macrition/commits/$1" \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("sha",""))'
+          }
           if [ -n "$SHA_INPUT" ]; then
-            echo "$SHA_INPUT" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: sha must be 40-hex"; exit 2; }
-            echo "TARGET_SHA=$SHA_INPUT" >> "$GITHUB_ENV"
+            # relay v8 (2026-11-04, OP-75 §4): the mistyped-SHA failure class —
+            # runs 41328996188/41332604168 died at checkout with "not our ref"
+            # because a non-40-hex or nonexistent object reached checkout.
+            # Accept branch/tag/PR refs, resolve EVERYTHING through the API,
+            # and verify the object EXISTS before checkout — a bad target now
+            # fails here with a clear message, never at checkout.
+            TARGET=$(resolve_ref "$SHA_INPUT")
+            echo "$TARGET" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: '$SHA_INPUT' did not resolve to a commit on the private repo (branch, tag, PR number, or 40-hex SHA accepted)"; exit 2; }
+            echo "resolved '$SHA_INPUT' -> $TARGET"
           else
             # relay v7 (2026-10-29): the default lineage of record is MAIN
             # (the OP-74 audit target) — integration/product-reconstruction
             # is 462 commits behind and is no longer the default target.
-            HEAD=$(curl -s -H "Authorization: Bearer $GH_PAT" \
-              "https://api.github.com/repos/Macrition/Storing-System-Macrition/branches/main" \
-              | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["commit"]["sha"])')
-            echo "$HEAD" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: head resolve failed"; exit 2; }
-            echo "TARGET_SHA=$HEAD" >> "$GITHUB_ENV"
+            TARGET=$(resolve_ref "main")
+            echo "$TARGET" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: main head resolve failed"; exit 2; }
           fi
+          EXIST=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GH_PAT" \
+            "https://api.github.com/repos/Macrition/Storing-System-Macrition/commits/$TARGET")
+          [ "$EXIST" = "200" ] || { echo "ERR: resolved target $TARGET not fetchable (HTTP $EXIST)"; exit 2; }
+          echo "TARGET_SHA=$TARGET" >> "$GITHUB_ENV"
 
       - name: Checkout private source at exact SHA (ephemeral, never persisted here)
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
