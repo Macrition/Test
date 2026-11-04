@@ -279,13 +279,23 @@ jobs:
             git diff --stat HEAD | tail -20
             echo "== git diff HEAD (max 200 lines) =="
             git diff HEAD | head -200
-          } > detail-gitstatus.log 2>&1 || true
-          DIRTY_N=$(grep -c '^ M\|^M\|^ D\|^D\|^ T\|^T' detail-gitstatus.log || true)
+          # relay v9 (2026-11-04, run 41894738450 finding): every detail
+          # log lives at the WORKSPACE ROOT (the wall/boot steps write
+          # ../../ from src) — this step used to write its own log in
+          # src/, which the encrypt step (also cwd src) then happily
+          # tarred while the REAL boot/wall logs at the root were never
+          # collected. One directory for all evidence, fail closed.
+          } > ../../detail-gitstatus.log 2>&1 || true
+          DIRTY_N=$(grep -c '^ M\|^M\|^ D\|^D\|^ T\|^T' ../../detail-gitstatus.log || true)
           echo "post-wall tracked-tree state: ${DIRTY_N} dirty entries (detail encrypted)"
 
       - name: Encrypt detailed evidence
         if: always()
-        working-directory: src
+        # relay v9 (2026-11-04, run 41894738450 finding): this step ran
+        # cwd src/ and collected PLACEHOLDER logs while the real ones
+        # (written ../../ from src) sat at the workspace root — every
+        # RED since 2026-10-29 shipped empty evidence. Run at the root:
+        # same directory as the writers and the upload step.
         env:
           RELAY_PASS: ${{ secrets.TEST_RELAY_PASS }}
         run: |
