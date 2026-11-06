@@ -270,12 +270,14 @@ jobs:
             echo "VERDICT ${{ matrix.name }}: RED (no summary produced — boot or an earlier step failed; see encrypted artifact)"
             exit 0
           fi
+          SUMMARY=$(cat "$GITHUB_WORKSPACE/db-summary.json")
+          echo "DB at $TARGET_SHA on ${{ matrix.name }}: $SUMMARY"
           python3 -c '
           import json, sys
           s = json.loads(sys.argv[1])
           if s["failures"] or s["errors"]:
               print("VERDICT ${{ matrix.name }}: RED (regression set red — detail encrypted)"); sys.exit(1)
-          print("VERDICT ${{ matrix.name }}: GREEN")' "$GITHUB_WORKSPACE/db-summary.json"
+          print("VERDICT ${{ matrix.name }}: GREEN")' "$SUMMARY"
 
       - name: Prove the checkout is clean (the OP-65 #31 law)
         if: always()
