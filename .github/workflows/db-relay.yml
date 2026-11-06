@@ -1,0 +1,333 @@
+name: DB Relay
+
+# Hosted cross-database compatibility lane for the private Macrition
+# system, on free public-repo runners. This is the public-channel twin of
+# the private repo's `sql-compatibility` job (laravel-ci.yml) — the
+# S38-F12 / SQL-1093 promotion gate that the private Actions channel can
+# no longer execute (the private-repo minutes are exhausted: every job
+# dies at the pre-step with zero steps and no runner assigned — the
+# OP-60 / OP-82 infrastructure record, task-292).
+#
+# WHAT IT DOES at an EXACT private-repo SHA, per backend
+# (MySQL 8.4, MySQL 5.7, MariaDB 10.4 — the official matrix):
+#   1. fresh migrate + seed against a real service container
+#      (the exact step that SQL 1093 broke; the a75044a53 derived-table
+#      fix's hosted proof of record),
+#   2. the committed FULLTEXT probe (foods index + canonical search),
+#   3. the official driver-sensitive regression set (the 7 files the
+#      private lane runs),
+#   4. the clean-tracked-tree proof.
+#
+# NO-LEAK DESIGN (identical doctrine to test-relay.yml, all enforced):
+#   1. The private source is fetched to the EPHEMERAL runner disk only
+#      (actions/checkout with a token secret, persist-credentials:
+#      false). Nothing is ever committed to this public repo.
+#   2. The PUBLIC run log carries ONLY: the tested SHA, the backend,
+#      suite verdicts, and aggregate counts. Every step whose output
+#      could embed private-derived detail (composer, artisan, phpunit,
+#      tinker) redirects into detail logs that are never printed.
+#   3. Detailed evidence (full logs + per-file JUnit) is AES-256-
+#      encrypted with the TEST_RELAY_PASS secret before upload;
+#      decryptable only by the secret holder.
+#   4. The runner source tree is removed at the end (defense in depth).
+#
+# TRIGGER SURFACE: workflow_dispatch ONLY — collaborators only (forks
+# and anonymous users can neither dispatch nor read secrets).
+#
+# FIDELITY: the backend matrix, service health checks, env block, PHP
+# version, probe code and the 7-file regression set are copied 1:1 from
+# the private lane of record (laravel-ci.yml sql-compatibility at the
+# composition head) so a DB Relay GREEN maps directly onto the official
+# promotion gate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Exact 40-hex commit SHA (or branch/tag/PR ref) on the private repo to test (default: main head)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-relay
+  cancel-in-progress: false
+
+jobs:
+  sql:
+    name: DB compatibility (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: MySQL 8.4
+            slug: mysql84
+            image: mysql:8.4
+            driver: mysql
+          - name: MySQL 5.7
+            slug: mysql57
+            image: mysql:5.7
+            driver: mysql
+          - name: MariaDB 10.4
+            slug: mariadb104
+            image: mariadb:10.4
+            driver: mariadb
+
+    services:
+      sql:
+        image: ${{ matrix.image }}
+        env:
+          MYSQL_DATABASE: macrition_ci
+          MYSQL_ROOT_PASSWORD: root
+          MARIADB_DATABASE: macrition_ci
+          MARIADB_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=12
+
+    env:
+      APP_ENV: testing
+      DB_CONNECTION: ${{ matrix.driver }}
+      DB_HOST: 127.0.0.1
+      DB_PORT: 3306
+      DB_DATABASE: macrition_ci
+      DB_USERNAME: root
+      DB_PASSWORD: root
+      CACHE_STORE: array
+      SESSION_DRIVER: array
+      QUEUE_CONNECTION: sync
+      MAIL_MAILER: array
+
+    steps:
+      - name: Resolve target SHA
+        env:
+          GH_PAT: ${{ secrets.OPS_GH_PAT }}
+          SHA_INPUT: ${{ github.event.inputs.sha }}
+        run: |
+          set -euo pipefail
+          RESOLVE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GH_PAT" \
+            "https://api.github.com/repos/Macrition/Storing-System-Macrition/commits/main")
+          [ "$RESOLVE" = "200" ] || { echo "ERR: OPS_GH_PAT cannot read the private repo (HTTP $RESOLVE) — the secret is expired/revoked or lacks Contents:read. Update the secret; do not debug the lane."; exit 2; }
+          resolve_ref () {
+            curl -s -H "Authorization: Bearer $GH_PAT" \
+              "https://api.github.com/repos/Macrition/Storing-System-Macrition/commits/$1" \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("sha",""))'
+          }
+          if [ -n "$SHA_INPUT" ]; then
+            # relay v8 law: resolve EVERYTHING through the API and verify
+            # the object EXISTS before checkout — a bad target fails here
+            # with a clear message, never at checkout.
+            TARGET=$(resolve_ref "$SHA_INPUT")
+            echo "$TARGET" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: '$SHA_INPUT' did not resolve to a commit on the private repo (branch, tag, PR number, or 40-hex SHA accepted)"; exit 2; }
+            echo "resolved '$SHA_INPUT' -> $TARGET"
+          else
+            TARGET=$(resolve_ref "main")
+            echo "$TARGET" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: main head resolve failed"; exit 2; }
+          fi
+          EXIST=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GH_PAT" \
+            "https://api.github.com/repos/Macrition/Storing-System-Macrition/commits/$TARGET")
+          [ "$EXIST" = "200" ] || { echo "ERR: resolved target $TARGET not fetchable (HTTP $EXIST)"; exit 2; }
+          echo "TARGET_SHA=$TARGET" >> "$GITHUB_ENV"
+
+      - name: Checkout private source at exact SHA (ephemeral, never persisted here)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Macrition/Storing-System-Macrition
+          ref: ${{ env.TARGET_SHA }}
+          token: ${{ secrets.OPS_GH_PAT }}
+          persist-credentials: false
+          path: src
+
+      - name: Resolve app layout (root or nested)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          if [ -f composer.json ] && [ -d tests ] && [ -f phpunit.xml ]; then
+            echo "APP_DIR=src" >> "$GITHUB_ENV"
+            echo "layout: root (application at repository root)"
+          elif [ -f workspace/macrition-laravel/composer.json ]; then
+            echo "APP_DIR=src/workspace/macrition-laravel" >> "$GITHUB_ENV"
+            echo "layout: nested (application under workspace/)"
+          else
+            echo "ERR: unknown layout - neither root app nor nested app found at $TARGET_SHA"
+            exit 2
+          fi
+
+      - name: Setup PHP 8.5 + PDO MySQL (the official sql-compatibility lane pin)
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962
+        with:
+          php-version: '8.5'
+          extensions: mbstring, curl, openssl, sodium, pdo_mysql, dom, fileinfo, gd, gmp
+          coverage: none
+
+      - name: Install exact dependencies (output private)
+        working-directory: ${{ env.APP_DIR }}
+        run: composer install --no-interaction --no-progress --prefer-dist --quiet > "$GITHUB_WORKSPACE/detail-install.log" 2>&1
+
+      - name: Fresh migrate + seed on ${{ matrix.name }} (the S38-F12 proof, output private)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          {
+            cp .env.example .env
+            php artisan key:generate --force
+            php artisan migrate:fresh --seed --force
+          } > "$GITHUB_WORKSPACE/detail-boot.log" 2>&1
+          echo "MIGRATE+SEED on ${{ matrix.name }}: OK (the full migration chain + seed completed)"
+
+      - name: Committed FULLTEXT probe (output private, verdict public)
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          set -euo pipefail
+          rc=0
+          php artisan tinker --execute='
+            if (!\App\Models\Food::mysqlFullTextAvailable()) {
+                throw new \RuntimeException("foods FULLTEXT index missing");
+            }
+            \Illuminate\Support\Facades\Cache::put(
+                \App\Food\FoodSearchService::SEARCH_BACKEND_CACHE_KEY,
+                "mysql_fulltext",
+                now()->addMinute()
+            );
+            $rows = app(\App\Food\FoodSearchService::class)->canonicalSearch("chicken", 5);
+            if (count($rows) < 1) {
+                throw new \RuntimeException("committed FULLTEXT search returned no seeded chicken rows");
+            }
+            \Illuminate\Support\Facades\Cache::forget(\App\Food\FoodSearchService::SEARCH_BACKEND_CACHE_KEY);
+          ' > "$GITHUB_WORKSPACE/detail-probe.log" 2>&1 || rc=$?
+          if [ $rc -eq 0 ]; then
+            echo "FULLTEXT probe on ${{ matrix.name }}: OK (index present, seeded chicken rows returned)"
+          else
+            echo "FULLTEXT probe on ${{ matrix.name }}: FAILED (detail encrypted)"
+          fi
+          exit $rc
+
+      - name: Driver-sensitive regression set (the official 7 files, aggregate public)
+        working-directory: ${{ env.APP_DIR }}
+        env:
+          JUNIT_DIR: ${{ runner.temp }}/db-relay-junit
+        run: |
+          set +e
+          mkdir -p "$JUNIT_DIR"
+          cat > /tmp/parse_junit.py <<'PYEOF'
+          import sys, xml.etree.ElementTree as ET
+          try:
+              root = ET.parse(sys.argv[1]).getroot()
+              tops = [root] if root.tag == 'testsuite' else list(root.findall('testsuite'))
+              t = a = f = e = s = 0
+              for ts in tops:
+                  t += int(ts.get('tests', 0) or 0)
+                  a += int(ts.get('assertions', 0) or 0)
+                  f += int(ts.get('failures', 0) or 0)
+                  e += int(ts.get('errors', 0) or 0)
+                  s += int(ts.get('skipped', 0) or 0)
+              print(t, a, f, e, s)
+          except Exception:
+              print(0, 0, 1, 0, 0)
+          PYEOF
+          T_TOTAL=0; A_TOTAL=0; F_FILES=0; FAILS=0; ERRS=0; SKIPS=0; RC=0
+          : > "$GITHUB_WORKSPACE/detail-tests.log"
+          # the official lane's exact regression set, sliced per file so one
+          # born-red file cannot mask the rest (the e150 channel law).
+          for FILE in \
+            tests/Feature/MigrationPortabilityTest.php \
+            tests/Feature/S74TierIntegrityTest.php \
+            tests/Feature/S79AuthPrivacyIntegrityTest.php \
+            tests/Feature/S109RefundWorkflowTest.php \
+            tests/Feature/S111PersistenceTruthTest.php \
+            tests/Feature/S113ProfessionalCommunityTest.php \
+            tests/Feature/S98FoodCorpusScaleTest.php
+          do
+            BASE=$(basename "$FILE" .php)
+            OUT=$(timeout 600 php vendor/bin/phpunit --no-coverage --no-progress --log-junit "$JUNIT_DIR/$BASE.junit.xml" "$FILE" 2>&1)
+            PRC=$?
+            echo "$OUT" >> "$GITHUB_WORKSPACE/detail-tests.log"
+            LINE=$(python3 /tmp/parse_junit.py "$JUNIT_DIR/$BASE.junit.xml")
+            read -r NT NA NF NE NS <<< "$LINE"
+            T_TOTAL=$((T_TOTAL+NT)); A_TOTAL=$((A_TOTAL+NA)); F_FILES=$((F_FILES+1))
+            FAILS=$((FAILS+NF)); ERRS=$((ERRS+NE)); SKIPS=$((SKIPS+NS))
+            if [ "$PRC" -ne 0 ]; then RC=1; echo "SLICE-FAIL: $BASE (rc=$PRC; $NT tests / $NA assertions / $NF failures / $NE errors)" >> "$GITHUB_WORKSPACE/detail-tests.log"; fi
+          done
+          cat > "$GITHUB_WORKSPACE/db-summary.json" <<JSONEOF
+          {"backend": "${{ matrix.name }}", "sha": "$TARGET_SHA", "test_files": $F_FILES, "tests": $T_TOTAL, "assertions": $A_TOTAL, "failures": $FAILS, "errors": $ERRS, "skipped": $SKIPS}
+          JSONEOF
+          cat "$GITHUB_WORKSPACE/db-summary.json"
+          exit $RC
+
+      - name: Backend verdict (public aggregate only)
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ ! -f "$GITHUB_WORKSPACE/db-summary.json" ] || [ ! -s "$GITHUB_WORKSPACE/db-summary.json" ]; then
+            echo "VERDICT ${{ matrix.name }}: RED (no summary produced — boot or an earlier step failed; see encrypted artifact)"
+            exit 0
+          fi
+          python3 -c '
+          import json, sys
+          s = json.loads(sys.argv[1])
+          if s["failures"] or s["errors"]:
+              print("VERDICT ${{ matrix.name }}: RED (regression set red — detail encrypted)"); sys.exit(1)
+          print("VERDICT ${{ matrix.name }}: GREEN")' "$GITHUB_WORKSPACE/db-summary.json"
+
+      - name: Prove the checkout is clean (the OP-65 #31 law)
+        if: always()
+        run: |
+          set -uo pipefail
+          [ -d "$GITHUB_WORKSPACE/src/.git" ] || { echo "CLEAN-TREE ${{ matrix.name }}: SKIPPED (no checkout to prove)"; exit 0; }
+          cd "$GITHUB_WORKSPACE/src"
+          {
+            echo "== git status --porcelain --untracked-files=no =="
+            git status --porcelain --untracked-files=no
+            echo "== git diff --stat HEAD =="
+            git diff --stat HEAD | tail -20
+          } > "$GITHUB_WORKSPACE/detail-gitstatus.log" 2>&1 || true
+          DIRTY=$(git status --porcelain --untracked-files=no)
+          if [ -n "$DIRTY" ]; then
+            # the doctrine: no private-derived paths in the public log —
+            # the count only; the names live in the encrypted detail log.
+            echo "CLEAN-TREE on ${{ matrix.name }}: FAILED ($(echo "$DIRTY" | wc -l) dirty entries — detail encrypted)"
+            exit 1
+          fi
+          echo "CLEAN-TREE on ${{ matrix.name }}: OK (the compatibility run left the checkout clean)"
+
+      - name: Encrypt detailed evidence
+        if: always()
+        env:
+          RELAY_PASS: ${{ secrets.TEST_RELAY_PASS }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          [ -f detail-install.log ] || : > detail-install.log
+          [ -f detail-boot.log ] || : > detail-boot.log
+          [ -f detail-probe.log ] || : > detail-probe.log
+          [ -f detail-tests.log ] || : > detail-tests.log
+          [ -f detail-gitstatus.log ] || : > detail-gitstatus.log
+          [ -f db-summary.json ] || : > db-summary.json
+          mkdir -p junit-receipts
+          if [ -d "${RUNNER_TEMP:-/tmp}/db-relay-junit" ]; then
+            cp "${RUNNER_TEMP:-/tmp}/db-relay-junit"/*.junit.xml junit-receipts/ 2>/dev/null || true
+          fi
+          tar czf "evidence-${{ matrix.slug }}.tgz" detail-install.log detail-boot.log detail-probe.log detail-tests.log detail-gitstatus.log db-summary.json junit-receipts
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in "evidence-${{ matrix.slug }}.tgz" -out "db-relay-${{ matrix.slug }}-evidence.enc" -pass env:RELAY_PASS
+          rm -f "evidence-${{ matrix.slug }}.tgz" detail-*.log db-summary.json; rm -rf junit-receipts
+
+      - name: Upload encrypted artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: db-relay-${{ matrix.slug }}-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: db-relay-${{ matrix.slug }}-evidence.enc
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Cleanup runner source (defense in depth)
+        if: always()
+        run: rm -rf "$GITHUB_WORKSPACE/src"
