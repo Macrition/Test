@@ -40,6 +40,10 @@ on:
         description: 'wall | hygiene | wall,hygiene'
         required: false
         default: 'wall,hygiene'
+      php:
+        description: "PHP leg: '8.4' (the certified lane pin) | '8.5' (the CI-matrix leg of record)"
+        required: false
+        default: '8.4'
 
 permissions:
   contents: read
@@ -120,10 +124,10 @@ jobs:
             exit 2
           fi
 
-      - name: Setup PHP 8.4 (mirrors the certified lane pin)
+      - name: Setup PHP (the dispatched leg; default 8.4 = the certified lane pin)
         uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
         with:
-          php-version: '8.4'
+          php-version: ${{ github.event.inputs.php || '8.4' }}
           extensions: mbstring, curl, openssl, sodium, sqlite3, pdo_sqlite, dom, fileinfo, gd, gmp
           coverage: none
 
@@ -259,7 +263,7 @@ jobs:
             exit 1
           fi
           SUMMARY=$(cat ../../wall-summary.json)
-          echo "WALL at $TARGET_SHA: $SUMMARY"
+          echo "WALL at $TARGET_SHA (php $(php -r 'echo PHP_VERSION;') on ${{ github.event.inputs.php || '8.4' }}-leg): $SUMMARY"
           python3 -c '
           import json, sys
           s = json.loads(sys.argv[1])
