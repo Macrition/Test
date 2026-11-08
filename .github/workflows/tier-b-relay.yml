@@ -1,0 +1,203 @@
+name: Tier-B Relay
+
+# (OP-100 tranche 2) The Tier-B golden-matrix visual-regression leg of the
+# public relay channel. Runs the curated pixel-diff gate (the private repo's
+# tests/Browser/tier-b runner + the Git goldens) at an EXACT private-repo
+# SHA, on free public-repo runners.
+#
+# NO-LEAK DESIGN (the test-relay.yml rules, verbatim):
+#   1. The private source (incl. the golden PNGs) is fetched to the
+#      EPHEMERAL runner disk only (persist-credentials: false). Nothing is
+#      ever committed to this public repo.
+#   2. The PUBLIC run log carries ONLY: the tested SHA, the verdict and the
+#      green/amber/red/harness counts. Per-cell statuses, diff ratios and
+#      masked diff PNGs ride the encrypted artifact only.
+#   3. Detailed evidence is AES-256-encrypted with the RELAY_PASS secret
+#      before upload; decryptable only by the secret holder.
+#
+# The fixture credentials embedded below are SIM-ONLY values for the
+# ephemeral SQLite instance booted inside the run (the TierAFixtureSeeder
+# contract: they provision nothing outside the runner disk and unlock no
+# real system).
+#
+# TRIGGER SURFACE: workflow_dispatch ONLY — collaborators only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Exact 40-hex commit SHA to diff (default: main head)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tier-b-relay
+  cancel-in-progress: false
+
+jobs:
+  tier-b:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Resolve target SHA
+        env:
+          GH_PAT: ${{ secrets.OPS_GH_PAT }}
+          SHA_INPUT: ${{ github.event.inputs.sha }}
+        run: |
+          set -euo pipefail
+          RESOLVE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GH_PAT" \
+            "https://api.github.com/repos/Macrition/Storing-System-Macrition/commits/main")
+          [ "$RESOLVE" = "200" ] || { echo "ERR: OPS_GH_PAT cannot read the private repo (HTTP $RESOLVE)"; exit 2; }
+          resolve_ref () {
+            curl -s -H "Authorization: Bearer $GH_PAT" \
+              "https://api.github.com/repos/Macrition/Storing-System-Macrition/commits/$1" \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("sha",""))'
+          }
+          if [ -n "$SHA_INPUT" ]; then
+            TARGET=$(resolve_ref "$SHA_INPUT")
+            echo "$TARGET" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: '$SHA_INPUT' did not resolve to a commit"; exit 2; }
+            echo "resolved '$SHA_INPUT' -> $TARGET"
+          else
+            TARGET=$(resolve_ref "main")
+            echo "$TARGET" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: main head resolve failed"; exit 2; }
+          fi
+          EXIST=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GH_PAT" \
+            "https://api.github.com/repos/Macrition/Storing-System-Macrition/commits/$TARGET")
+          [ "$EXIST" = "200" ] || { echo "ERR: resolved target $TARGET not fetchable (HTTP $EXIST)"; exit 2; }
+          echo "TARGET_SHA=$TARGET" >> "$GITHUB_ENV"
+
+      - name: Checkout private source at exact SHA (ephemeral, never persisted here)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Macrition/Storing-System-Macrition
+          ref: ${{ env.TARGET_SHA }}
+          token: ${{ secrets.OPS_GH_PAT }}
+          persist-credentials: false
+          path: src
+
+      - name: Fail-closed gate (the tier-b lane must exist at this SHA)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          test -f tests/Browser/tier-b/runner.mjs || { echo "ERR: tests/Browser/tier-b/runner.mjs absent at $TARGET_SHA — the Tier-B lane starts at the OP-100 lineage (main b90bf8707+)"; exit 2; }
+          test -f tests/Browser/tier-b/goldens/manifest.json || { echo "ERR: the golden manifest absent at $TARGET_SHA (missing-baseline by construction)"; exit 2; }
+          test -d node_modules 2>/dev/null || true
+          echo "tier-b lane present at $TARGET_SHA"
+
+      - name: Setup PHP (the certified lane pin)
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
+        with:
+          php-version: '8.4'
+          extensions: mbstring, curl, openssl, sodium, sqlite3, pdo_sqlite, dom, fileinfo, gd, gmp
+          coverage: none
+
+      - name: Install exact dependencies (output private)
+        working-directory: src
+        run: composer install --no-interaction --no-progress --prefer-dist --quiet > ../detail-install.log 2>&1
+
+      - name: Install the node test deps + chromium (output private)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          {
+            npm ci --no-progress --no-fund --no-audit
+            npx playwright install --with-deps chromium
+          } > ../detail-node.log 2>&1
+
+      - name: Boot the sim + the golden fixtures (output private)
+        working-directory: src
+        env:
+          TIER_A_FIXTURE_EMAIL: tierb.member@macrition.test
+          TIER_A_FIXTURE_PASSWORD: TierB-Golden-2026!
+          TIER_A_ADMIN_EMAIL: tierb.admin@macrition.test
+          TIER_A_ADMIN_PASSWORD: TierB-Admin-2026!
+          TIER_A_ADMIN_TOTP_SECRET: JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP
+        run: |
+          set -euo pipefail
+          {
+            cp .env.example .env
+            # the sim-serve law: APP_URL must match the served origin
+            sed -i 's#^APP_URL=.*#APP_URL=http://127.0.0.1:8080#' .env
+            grep -q '^SESSION_SECURE_COOKIE=' .env && sed -i 's#^SESSION_SECURE_COOKIE=.*#SESSION_SECURE_COOKIE=false#' .env || echo 'SESSION_SECURE_COOKIE=false' >> .env
+            touch database/database.sqlite
+            php artisan key:generate --force
+            php artisan migrate:fresh --seed --force
+            php artisan db:seed --class=TierAFixtureSeeder --force
+            php artisan db:seed --class=TierBGoldenFixtureSeeder --force
+            nohup php artisan serve --host=127.0.0.1 --port=8080 > ../detail-serve.log 2>&1 &
+            sleep 5
+            curl -s -o /dev/null -w 'sim boot probe: HTTP %{http_code}\n' http://127.0.0.1:8080/
+          } > ../detail-boot.log 2>&1
+          grep -q 'HTTP 200' ../detail-boot.log || { echo "ERR: the sim did not boot (detail encrypted)"; exit 2; }
+
+      - name: Run the Tier-B golden matrix (compare mode)
+        working-directory: src
+        env:
+          TIER_A_BASE_URL: http://127.0.0.1:8080
+          TIER_A_FIXTURE_EMAIL: tierb.member@macrition.test
+          TIER_A_FIXTURE_PASSWORD: TierB-Golden-2026!
+          TIER_A_ADMIN_EMAIL: tierb.admin@macrition.test
+          TIER_A_ADMIN_PASSWORD: TierB-Admin-2026!
+          TIER_A_ADMIN_TOTP_SECRET: JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP
+          TIER_B_ARTIFACT_DIR: ../tier-b-evidence
+        run: |
+          set -uo pipefail
+          set +e
+          timeout 1500 node tests/Browser/tier-b/runner.mjs > ../detail-tierb.log 2>&1
+          RC=$?
+          # the public line: SHA + verdict + counts only (the no-leak rule 2)
+          python3 - <<'PYEOF' >> ../detail-tierb.log 2>&1
+          import glob, json, os
+          candidates = [os.path.abspath('../tier-b-evidence'), 'storage/app/tier-b']
+          reports = []
+          for c in candidates:
+              reports += sorted(glob.glob(os.path.join(c, 'report-*.json')))
+          if reports:
+              r = json.load(open(reports[-1]))
+              print("TIERB_SUMMARY: " + json.dumps({k: r.get(k) for k in ('mode','verdict','greens','ambers','reds','harness')}))
+          PYEOF
+          TIERB_SUMMARY=$(grep -o 'TIERB_SUMMARY: .*' ../detail-tierb.log | tail -1 || true)
+          echo "TIER-B at $TARGET_SHA: ${TIERB_SUMMARY:-NO-SUMMARY (detail encrypted)}"
+          exit $RC
+
+      - name: Collect the tier-b evidence
+        if: always()
+        working-directory: src
+        run: |
+          set -euo pipefail
+          mkdir -p ../tier-b-evidence
+          cp -r storage/app/tier-b/. ../tier-b-evidence/ 2>/dev/null || true
+          # the runner's report path fallback when TIER_B_ARTIFACT_DIR was honored
+          ls ../tier-b-evidence/ | head -40 > ../detail-evidence-list.log 2>&1 || true
+
+      - name: Encrypt detailed evidence
+        if: always()
+        env:
+          RELAY_PASS: ${{ secrets.TEST_RELAY_PASS }}
+        run: |
+          set -euo pipefail
+          [ -f detail-install.log ] || : > detail-install.log
+          [ -f detail-node.log ] || : > detail-node.log
+          [ -f detail-boot.log ] || : > detail-boot.log
+          [ -f detail-serve.log ] || : > detail-serve.log
+          [ -f detail-tierb.log ] || : > detail-tierb.log
+          [ -f detail-evidence-list.log ] || : > detail-evidence-list.log
+          tar czf evidence.tgz detail-install.log detail-node.log detail-boot.log detail-serve.log detail-tierb.log detail-evidence-list.log tier-b-evidence
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in evidence.tgz -out "$GITHUB_WORKSPACE/evidence.tgz.enc" -pass env:RELAY_PASS
+          rm -f evidence.tgz detail-*.log; rm -rf tier-b-evidence
+
+      - name: Upload encrypted artifact
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: tier-b-relay-${{ github.run_id }}-attempt-${{ github.run_attempt }}
+          path: evidence.tgz.enc
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Cleanup runner source (defense in depth)
+        if: always()
+        run: rm -rf src
