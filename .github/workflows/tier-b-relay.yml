@@ -127,11 +127,7 @@ jobs:
             php artisan migrate:fresh --seed --force
             php artisan db:seed --class=TierAFixtureSeeder --force
             php artisan db:seed --class=TierBGoldenFixtureSeeder --force
-            nohup php artisan serve --host=127.0.0.1 --port=8080 > ../detail-serve.log 2>&1 &
-            sleep 5
-            curl -s -o /dev/null -w 'sim boot probe: HTTP %{http_code}\n' http://127.0.0.1:8080/
           } > ../detail-boot.log 2>&1
-          grep -q 'HTTP 200' ../detail-boot.log || { echo "ERR: the sim did not boot (detail encrypted)"; exit 2; }
 
       - name: Run the Tier-B golden matrix (compare mode)
         working-directory: src
@@ -145,9 +141,22 @@ jobs:
           TIER_B_ARTIFACT_DIR: ../tier-b-evidence
         run: |
           set -uo pipefail
+          # (run 42486003593 finding) a background serve does NOT reliably
+          # survive the STEP boundary on hosted runners (the consent
+          # provisioning then dies on connection-refused -> exit 2) — the
+          # server and the matrix run in the SAME step's process group.
+          nohup php artisan serve --host=127.0.0.1 --port=8080 > ../detail-serve.log 2>&1 &
+          SERVE_PID=$!
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ || true)
+            [ "$CODE" = "200" ] && break
+            sleep 2
+          done
+          [ "$CODE" = "200" ] || { echo "ERR: the sim did not boot in-step (detail encrypted)"; kill $SERVE_PID 2>/dev/null || true; exit 2; }
           set +e
           timeout 1500 node tests/Browser/tier-b/runner.mjs > ../detail-tierb.log 2>&1
           RC=$?
+          kill $SERVE_PID 2>/dev/null || true
           # the public line: SHA + verdict + counts only (the no-leak rule 2)
           python3 - <<'PYEOF' >> ../detail-tierb.log 2>&1
           import glob, json, os
@@ -161,6 +170,9 @@ jobs:
           PYEOF
           TIERB_SUMMARY=$(grep -o 'TIERB_SUMMARY: .*' ../detail-tierb.log | tail -1 || true)
           echo "TIER-B at $TARGET_SHA: ${TIERB_SUMMARY:-NO-SUMMARY (detail encrypted)}"
+          # the public verdict + counts only (the runner's own summary line
+          # carries no cell details — the no-leak rule 2 holds)
+          grep '\[tier-b\] verdict' ../detail-tierb.log | tail -1 || true
           exit $RC
 
       - name: Collect the tier-b evidence
