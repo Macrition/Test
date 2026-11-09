@@ -1,0 +1,214 @@
+name: Tier-A Relay
+
+# (the independent-verification lane, 9 November 2026) The Tier-A
+# browser-product wall leg of the public relay channel — the dynamic
+# half of the S132 Tier-A wall (geometry/overflow, touch-target,
+# z-ladder/tokens, console, focus, auth-leak, injection, identity,
+# toast, escape/cascade checks) run at an EXACT private-repo SHA on
+# free public-repo runners. Mirrors tier-b-relay.yml (OP-100 tranche 2)
+# step for step; the two legs stay decoupled (separate concurrency
+# groups, neither waits behind the other).
+#
+# NO-LEAK DESIGN (the test-relay.yml / tier-b-relay.yml rules, verbatim):
+#   1. The private source is fetched to the EPHEMERAL runner disk only
+#      (persist-credentials: false). Nothing is ever committed here.
+#   2. The PUBLIC run log carries ONLY: the tested SHA, the verdict and
+#      the green/red/flaky counts. Per-cell statuses and the full JSON
+#      report ride the encrypted artifact only. (The wall stores NO
+#      screenshots anywhere — Gate 8 / D-6.)
+#   3. Detailed evidence is AES-256-encrypted with the TEST_RELAY_PASS
+#      secret before upload; decryptable only by the secret holder.
+#
+# The fixture credentials embedded below are SIM-ONLY values for the
+# ephemeral SQLite instance booted inside the run (the TierAFixtureSeeder
+# contract: they provision nothing outside the runner disk and unlock no
+# real system).
+#
+# TRIGGER SURFACE: workflow_dispatch ONLY — collaborators only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: 'Exact 40-hex commit SHA to measure (default: main head)'
+        required: false
+        default: ''
+      check:
+        description: 'Optional single check family (e.g. A-10); default: the full matrix'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tier-a-relay
+  cancel-in-progress: false
+
+jobs:
+  tier-a:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Resolve target SHA
+        env:
+          GH_PAT: ${{ secrets.OPS_GH_PAT }}
+          SHA_INPUT: ${{ github.event.inputs.sha }}
+        run: |
+          set -euo pipefail
+          RESOLVE=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GH_PAT" \
+            "https://api.github.com/repos/Macrition/Storing-System-Macrition/commits/main")
+          [ "$RESOLVE" = "200" ] || { echo "ERR: OPS_GH_PAT cannot read the private repo (HTTP $RESOLVE)"; exit 2; }
+          resolve_ref () {
+            curl -s -H "Authorization: Bearer $GH_PAT" \
+              "https://api.github.com/repos/Macrition/Storing-System-Macrition/commits/$1" \
+              | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("sha",""))'
+          }
+          if [ -n "$SHA_INPUT" ]; then
+            TARGET=$(resolve_ref "$SHA_INPUT")
+            echo "$TARGET" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: '$SHA_INPUT' did not resolve to a commit"; exit 2; }
+            echo "resolved '$SHA_INPUT' -> $TARGET"
+          else
+            TARGET=$(resolve_ref "main")
+            echo "$TARGET" | grep -qE '^[0-9a-f]{40}$' || { echo "ERR: main head resolve failed"; exit 2; }
+          fi
+          EXIST=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $GH_PAT" \
+            "https://api.github.com/repos/Macrition/Storing-System-Macrition/commits/$TARGET")
+          [ "$EXIST" = "200" ] || { echo "ERR: resolved target $TARGET not fetchable (HTTP $EXIST)"; exit 2; }
+          echo "TARGET_SHA=$TARGET" >> "$GITHUB_ENV"
+
+      - name: Checkout private source at exact SHA (ephemeral, never persisted here)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: Macrition/Storing-System-Macrition
+          ref: ${{ env.TARGET_SHA }}
+          token: ${{ secrets.OPS_GH_PAT }}
+          persist-credentials: false
+          path: src
+
+      - name: Fail-closed gate (the tier-a lane must exist at this SHA)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          test -f tests/Browser/tier-a/runner.mjs || { echo "ERR: tests/Browser/tier-a/runner.mjs absent at $TARGET_SHA — the dynamic Tier-A lane starts at the S132-foundations lineage"; exit 2; }
+          test -f tests/Browser/tier-a/config.mjs || { echo "ERR: tests/Browser/tier-a/config.mjs absent at $TARGET_SHA"; exit 2; }
+          test -f tests/Browser/tier-a-allowlist.json || { echo "ERR: the allowlist absent at $TARGET_SHA (fail-closed D-2 surface)"; exit 2; }
+          echo "tier-a lane present at $TARGET_SHA"
+
+      - name: Setup PHP (the certified lane pin)
+        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
+        with:
+          php-version: '8.4'
+          extensions: mbstring, curl, openssl, sodium, sqlite3, pdo_sqlite, dom, fileinfo, gd, gmp
+          coverage: none
+
+      - name: Install exact dependencies (output private)
+        working-directory: src
+        run: composer install --no-interaction --no-progress --prefer-dist --quiet > ../detail-install.log 2>&1
+
+      - name: Install the node test deps + chromium (output private)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          {
+            npm ci --no-progress --no-fund --no-audit
+            npx playwright install --with-deps chromium
+          } > ../detail-node.log 2>&1
+
+      - name: Boot the sim + the Tier-A fixture (output private)
+        working-directory: src
+        env:
+          TIER_A_FIXTURE_EMAIL: tierb.member@macrition.test
+          TIER_A_FIXTURE_PASSWORD: TierB-Golden-2026!
+          TIER_A_ADMIN_EMAIL: tierb.admin@macrition.test
+          TIER_A_ADMIN_PASSWORD: TierB-Admin-2026!
+          TIER_A_ADMIN_TOTP_SECRET: JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP
+        run: |
+          set -euo pipefail
+          {
+            cp .env.example .env
+            # the sim-serve law: APP_URL must match the served origin
+            sed -i 's#^APP_URL=.*#APP_URL=http://127.0.0.1:8080#' .env
+            grep -q '^SESSION_SECURE_COOKIE=' .env && sed -i 's#^SESSION_SECURE_COOKIE=.*#SESSION_SECURE_COOKIE=false#' .env || echo 'SESSION_SECURE_COOKIE=false' >> .env
+            touch database/database.sqlite
+            php artisan key:generate --force
+            php artisan migrate:fresh --seed --force
+            php artisan db:seed --class=Database\\Seeders\\TierAFixtureSeeder --force
+          } > ../detail-boot.log 2>&1
+
+      - name: Run the Tier-A browser-product wall
+        working-directory: src
+        env:
+          TIER_A_BASE_URL: http://127.0.0.1:8080
+          TIER_A_FIXTURE_EMAIL: tierb.member@macrition.test
+          TIER_A_FIXTURE_PASSWORD: TierB-Golden-2026!
+          TIER_A_ADMIN_EMAIL: tierb.admin@macrition.test
+          TIER_A_ADMIN_PASSWORD: TierB-Admin-2026!
+          TIER_A_ADMIN_TOTP_SECRET: JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP
+          TIER_A_ARTIFACT_DIR: ../tier-a-evidence
+          TIER_A_BRANCH: relay-tier-a
+          TIER_A_COMMIT: ${{ env.TARGET_SHA }}
+          TIER_A_CHECK: ${{ github.event.inputs.check }}
+        run: |
+          set -uo pipefail
+          # (run 42486003593 finding, tier-b leg) a background serve does NOT
+          # reliably survive the STEP boundary on hosted runners (the consent
+          # provisioning then dies on connection-refused -> exit 2) — the
+          # server and the matrix run in the SAME step's process group.
+          nohup php artisan serve --host=127.0.0.1 --port=8080 > ../detail-serve.log 2>&1 &
+          SERVE_PID=$!
+          CODE=000
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ || true)
+            [ "$CODE" = "200" ] && break
+            sleep 2
+          done
+          [ "$CODE" = "200" ] || { echo "ERR: the sim did not boot in-step (detail encrypted)"; kill $SERVE_PID 2>/dev/null || true; exit 2; }
+          set +e
+          if [ -n "$TIER_A_CHECK" ]; then
+            timeout 2400 node tests/Browser/tier-a/runner.mjs --check="$TIER_A_CHECK" > ../detail-tiera.log 2>&1
+          else
+            timeout 2400 node tests/Browser/tier-a/runner.mjs > ../detail-tiera.log 2>&1
+          fi
+          RC=$?
+          kill $SERVE_PID 2>/dev/null || true
+          # the public line: SHA + verdict + counts only (the no-leak rule 2)
+          TIERA_SUMMARY=$(grep -oE '\[tier-a/[0-9.]+\] [0-9]+/[0-9]+ rows green.*' ../detail-tiera.log | tail -1 || true)
+          echo "TIER-A at $TARGET_SHA: ${TIERA_SUMMARY:-NO-SUMMARY (detail encrypted)}"
+          grep '\[tier-a\] RED' ../detail-tiera.log | head -5 || true
+          exit $RC
+
+      - name: Collect the tier-a evidence
+        if: always()
+        working-directory: src
+        run: |
+          set -euo pipefail
+          mkdir -p ../tier-a-evidence
+          cp -r storage/app/tier-a/. ../tier-a-evidence/ 2>/dev/null || true
+          ls ../tier-a-evidence/ | head -40 > ../detail-evidence-list.log 2>&1 || true
+
+      - name: Encrypt detailed evidence
+        if: always()
+        env:
+          RELAY_PASS: ${{ secrets.TEST_RELAY_PASS }}
+        run: |
+          set -euo pipefail
+          [ -f detail-install.log ] || : > detail-install.log
+          [ -f detail-node.log ] || : > detail-node.log
+          [ -f detail-boot.log ] || : > detail-boot.log
+          [ -f detail-serve.log ] || : > detail-serve.log
+          [ -f detail-tiera.log ] || : > detail-tiera.log
+          [ -f detail-evidence-list.log ] || : > detail-evidence-list.log
+          [ -d tier-a-evidence ] || mkdir -p tier-a-evidence
+          tar czf evidence.tgz detail-install.log detail-node.log detail-boot.log detail-serve.log detail-tiera.log detail-evidence-list.log tier-a-evidence
+          openssl enc -aes-256-cbc -pbkdf2 -salt -in evidence.tgz -out evidence.tgz.enc -pass env:RELAY_PASS
+          rm -f evidence.tgz
+
+      - name: Upload the encrypted evidence artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: tier-a-evidence-${{ env.TARGET_SHA }}
+          path: evidence.tgz.enc
+          retention-days: 14
+          if-no-files-found: error
