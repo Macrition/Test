@@ -175,7 +175,10 @@ jobs:
           # the public line: SHA + verdict + counts only (the no-leak rule 2)
           TIERA_SUMMARY=$(grep -oE '\[tier-a/[0-9.]+\] [0-9]+/[0-9]+ rows green.*' ../detail-tiera.log | tail -1 || true)
           echo "TIER-A at $TARGET_SHA: ${TIERA_SUMMARY:-NO-SUMMARY (detail encrypted)}"
-          grep '\[tier-a\] RED' ../detail-tiera.log | head -5 || true
+          # (no-leak rule 2) per-cell RED detail stays in the encrypted
+          # artifact; the public surface carries the verdict + counts only.
+          REDS=$(grep -c '\[tier-a\] RED' ../detail-tiera.log || true)
+          echo "TIER-A red-cell count: ${REDS:-0} (detail encrypted)"
           exit $RC
 
       - name: Collect the tier-a evidence
