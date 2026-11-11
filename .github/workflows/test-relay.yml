@@ -133,7 +133,7 @@ jobs:
 
       - name: Install exact dependencies (output private)
         working-directory: ${{ env.APP_DIR }}
-        run: composer install --no-interaction --no-progress --prefer-dist --quiet > ../../detail-install.log 2>&1
+        run: composer install --no-interaction --no-progress --prefer-dist --quiet > ../detail-install.log 2>&1
 
       - name: Prepare isolated SQLite runtime (output private)
         working-directory: ${{ env.APP_DIR }}
@@ -144,7 +144,7 @@ jobs:
             touch database/database.sqlite
             php artisan key:generate --force
             php artisan migrate --seed --force
-          } > ../../detail-boot.log 2>&1
+          } > ../detail-boot.log 2>&1
 
       - name: Hygiene scan (tracked-surface secret gate at the exact SHA)
         if: contains(github.event.inputs.suites, 'hygiene')
@@ -225,7 +225,7 @@ jobs:
               print(0, 0, 1, 0, 0)
           PYEOF
           T_TOTAL=0; A_TOTAL=0; F_FILES=0; FAILS=0; ERRS=0; SKIPS=0; RC=0
-          : > ../../detail-wall.log
+          : > ../detail-wall.log
           # the e150 channel law (v4): per-file slices, the migration-manifest
           # side-effect restored at each boundary. LegacyImporterTest
           # regenerates the tracked database/migration-manifest.json with a
@@ -235,22 +235,29 @@ jobs:
           for SUITE_DIR in tests/Feature tests/Unit; do
             for FILE in $(ls "$SUITE_DIR"/*.php | sort); do
               BASE=$(basename "$FILE" .php)
-              OUT=$(timeout 600 php vendor/bin/phpunit --no-coverage --log-junit "$JUNIT_DIR/$BASE.junit.xml" "$FILE" 2>&1)
+              # relay v10 (run 43016234243 finding): the per-file budget — 600s for
+              # every file, EXCEPT the known-slow a11y crawl class (measured:
+              # it exceeds 600s hosted; the timeout kill left an EMPTY junit
+              # receipt and parse_junit's fail-closed path counted it as the
+              # standing '1F' — a timeout artifact, never a failing test).
+              TMO=600
+              case "$BASE" in S380DPublicMemberA11yTest) TMO=1800;; esac
+              OUT=$(timeout $TMO php vendor/bin/phpunit --no-coverage --log-junit "$JUNIT_DIR/$BASE.junit.xml" "$FILE" 2>&1)
               PRC=$?
-              echo "$OUT" >> ../../detail-wall.log
+              echo "$OUT" >> ../detail-wall.log
               LINE=$(python3 /tmp/parse_junit.py "$JUNIT_DIR/$BASE.junit.xml")
               read -r NT NA NF NE NS <<< "$LINE"
               T_TOTAL=$((T_TOTAL+NT)); A_TOTAL=$((A_TOTAL+NA)); F_FILES=$((F_FILES+1))
               FAILS=$((FAILS+NF)); ERRS=$((ERRS+NE)); SKIPS=$((SKIPS+NS))
-              if [ "$PRC" -ne 0 ]; then RC=1; echo "SLICE-FAIL: $BASE (rc=$PRC; $NT tests / $NA assertions / $NF failures / $NE errors)" >> ../../detail-wall.log; fi
-              git -C "$GITHUB_WORKSPACE/src" checkout -- "$MANIFEST_REL" 2>>../../detail-wall.log || true
+              if [ "$PRC" -ne 0 ]; then RC=1; echo "SLICE-FAIL: $BASE (rc=$PRC; $NT tests / $NA assertions / $NF failures / $NE errors)" >> ../detail-wall.log; fi
+              git -C "$GITHUB_WORKSPACE/src" checkout -- "$MANIFEST_REL" 2>>../detail-wall.log || true
             done
           done
-          cat > ../../wall-summary.json <<JSONEOF
+          cat > ../wall-summary.json <<JSONEOF
           {"test_classes": $F_FILES, "tests": $T_TOTAL, "assertions": $A_TOTAL, "failures": $FAILS, "errors": $ERRS, "skipped": $SKIPS}
           JSONEOF
-          echo "driver totals: files=$F_FILES tests=$T_TOTAL assertions=$A_TOTAL failures=$FAILS errors=$ERRS skipped=$SKIPS" >> ../../detail-wall.log
-          cat ../../wall-summary.json
+          echo "driver totals: files=$F_FILES tests=$T_TOTAL assertions=$A_TOTAL failures=$FAILS errors=$ERRS skipped=$SKIPS" >> ../detail-wall.log
+          cat ../wall-summary.json
           exit $RC
 
       - name: Wall verdict (public aggregate only)
@@ -258,11 +265,11 @@ jobs:
         working-directory: ${{ env.APP_DIR }}
         run: |
           set -euo pipefail
-          if [ ! -f ../../wall-summary.json ] || [ ! -s ../../wall-summary.json ]; then
+          if [ ! -f ../wall-summary.json ] || [ ! -s ../wall-summary.json ]; then
             echo "VERDICT: RED (no summary produced — see encrypted artifact)"
             exit 1
           fi
-          SUMMARY=$(cat ../../wall-summary.json)
+          SUMMARY=$(cat ../wall-summary.json)
           echo "WALL at $TARGET_SHA (php $(php -r 'echo PHP_VERSION;') on ${{ github.event.inputs.php || '8.4' }}-leg): $SUMMARY"
           python3 -c '
           import json, sys
@@ -285,19 +292,19 @@ jobs:
             git diff HEAD | head -200
           # relay v9 (2026-11-04, run 41894738450 finding): every detail
           # log lives at the WORKSPACE ROOT (the wall/boot steps write
-          # ../../ from src) — this step used to write its own log in
+          # ../ from src = the workspace root — relay v10 correction) — this step used to write its own log in
           # src/, which the encrypt step (also cwd src) then happily
           # tarred while the REAL boot/wall logs at the root were never
           # collected. One directory for all evidence, fail closed.
-          } > ../../detail-gitstatus.log 2>&1 || true
-          DIRTY_N=$(grep -c '^ M\|^M\|^ D\|^D\|^ T\|^T' ../../detail-gitstatus.log || true)
+          } > ../detail-gitstatus.log 2>&1 || true
+          DIRTY_N=$(grep -c '^ M\|^M\|^ D\|^D\|^ T\|^T' ../detail-gitstatus.log || true)
           echo "post-wall tracked-tree state: ${DIRTY_N} dirty entries (detail encrypted)"
 
       - name: Encrypt detailed evidence
         if: always()
         # relay v9 (2026-11-04, run 41894738450 finding): this step ran
         # cwd src/ and collected PLACEHOLDER logs while the real ones
-        # (written ../../ from src) sat at the workspace root — every
+        # (written ../ from src — the v10-corrected path; the v9-era ../../ wrote the PARENT) — every
         # RED since 2026-10-29 shipped empty evidence. Run at the root:
         # same directory as the writers and the upload step.
         env:
