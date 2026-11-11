@@ -141,6 +141,14 @@ jobs:
           set -euo pipefail
           {
             cp .env.example .env
+            # (relay v12, OP-192) the plain-http staging posture: the hosted
+            # runner serves over http; the shipped .env.example's
+            # SESSION_SECURE_COOKIE=true (the production default) trips the
+            # OP-185 sec_https conflict diagnostic (clients drop the Secure
+            # cookie on http). DEPLOY.md's own named remedy for plain-http
+            # installs. The diagnostic stays armed for the TLS production
+            # channel.
+            sed -i 's/^SESSION_SECURE_COOKIE=true$/SESSION_SECURE_COOKIE=false/' .env
             touch database/database.sqlite
             php artisan key:generate --force
             php artisan migrate --seed --force
