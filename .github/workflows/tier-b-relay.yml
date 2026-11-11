@@ -104,7 +104,27 @@ jobs:
           set -euo pipefail
           {
             npm ci --no-progress --no-fund --no-audit
-            npx playwright install --with-deps chromium
+            # (relay v11, 2026-11-11 OP-184 dispatch diagnosis) the
+            # --with-deps apt leg fails when the hosted runner cannot
+            # resolve the Ubuntu archive (azure.archive.ubuntu.com DNS,
+            # measured twice at 4f96acf855: the 14:00 + 15:49 batches,
+            # both browser relays; only the OPTIONAL font packages fail
+            # to fetch — the core browser libs ship in the ubuntu-24.04
+            # image). Resilience law: retry the full install, fall back
+            # to the no-deps install, then FAIL CLOSED on a chromium
+            # launch smoke — never a silently degraded browser run.
+            ok=0
+            for attempt in 1 2 3; do
+              echo "== playwright install attempt ${attempt} (with deps)"
+              if npx playwright install --with-deps chromium; then ok=1; break; fi
+              sleep $((attempt * 20))
+            done
+            if [ "$ok" -ne 1 ]; then
+              echo "== with-deps failed 3x — the no-deps fallback (the runner image's core libs)"
+              npx playwright install chromium
+            fi
+            echo "== chromium launch smoke (fail-closed)"
+            node -e "const { chromium } = require('playwright'); (async () => { const b = await chromium.launch(); const p = await b.newPage(); await p.setContent('<h1>ok</h1>'); await b.close(); console.log('chromium launch smoke: OK'); })().catch((e) => { console.error('chromium launch smoke FAILED:', e.message); process.exit(1); });"
           } > ../detail-node.log 2>&1
 
       - name: Boot the sim + the golden fixtures (output private)
