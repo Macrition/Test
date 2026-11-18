@@ -30,6 +30,14 @@ name: Test Relay
 # that upgrade is left to the account owner.
 
 on:
+  # (OP-244, the founder's scheduled-wall ask, 2026-11-18) the nightly
+  # hosted wall at the main head: scheduled runs take NO inputs, so the
+  # defaults apply (sha: '' = main head at run time, wall,hygiene,
+  # php 8.4 the certified lane pin). The public-repo cron channel
+  # observes the private main every night; failures surface through the
+  # badge/log without leaking anything (the no-leak rules above hold).
+  schedule:
+    - cron: '17 3 * * *'
   workflow_dispatch:
     inputs:
       sha:
