@@ -30,12 +30,23 @@ name: Test Relay
 # that upgrade is left to the account owner.
 
 on:
-  # (OP-244, the founder's scheduled-wall ask, 2026-11-18) the nightly
-  # hosted wall at the main head: scheduled runs take NO inputs, so the
-  # defaults apply (sha: '' = main head at run time, wall,hygiene,
-  # php 8.4 the certified lane pin). The public-repo cron channel
-  # observes the private main every night; failures surface through the
-  # badge/log without leaking anything (the no-leak rules above hold).
+  # (OP-244, the founder's scheduled-wall ask, 2026-11-18; RELAY v13 fix
+  # 2026-11-19) the nightly hosted wall at the main head: scheduled runs
+  # take NO inputs, so the defaults apply (sha: '' = main head at run
+  # time, wall,hygiene, php 8.4 the certified lane pin). The public-repo
+  # cron channel observes the private main every night; failures surface
+  # through the badge/log without leaking anything (the no-leak rules
+  # above hold).
+  #
+  # RELAY v13 (2026-11-19, the scheduled-run 44517809417 finding): the
+  # v12 gates read github.event.inputs.suites directly -- but scheduled
+  # events carry NO inputs, so both suite gates evaluated contains('',...)
+  # = false and the nightly run SKIPPED hygiene and the wall while still
+  # concluding SUCCESS (a green that tests nothing). Every suite gate now
+  # carries the `|| 'wall,hygiene'` fallback -- the same pattern the php
+  # leg always used -- so the schedule path (and a dispatch with a
+  # cleared suites input) runs the documented default suites. Explicit
+  # dispatch inputs are still honored unchanged.
   schedule:
     - cron: '17 3 * * *'
   workflow_dispatch:
@@ -163,7 +174,7 @@ jobs:
           } > ../detail-boot.log 2>&1
 
       - name: Hygiene scan (tracked-surface secret gate at the exact SHA)
-        if: contains(github.event.inputs.suites, 'hygiene')
+        if: contains(github.event.inputs.suites || 'wall,hygiene', 'hygiene')
         working-directory: src
         run: |
           set -euo pipefail
@@ -208,7 +219,7 @@ jobs:
           echo "tracked tree clean at $TARGET_SHA"
 
       - name: Full PHPUnit wall (the e150 slice discipline, hosted)
-        if: contains(github.event.inputs.suites, 'wall')
+        if: contains(github.event.inputs.suites || 'wall,hygiene', 'wall')
         working-directory: ${{ env.APP_DIR }}
         env:
           JUNIT_DIR: ${{ runner.temp }}/hosted-junit
@@ -277,7 +288,7 @@ jobs:
           exit $RC
 
       - name: Wall verdict (public aggregate only)
-        if: always() && contains(github.event.inputs.suites, 'wall')
+        if: always() && contains(github.event.inputs.suites || 'wall,hygiene', 'wall')
         working-directory: ${{ env.APP_DIR }}
         run: |
           set -euo pipefail
@@ -295,7 +306,7 @@ jobs:
           print("VERDICT: GREEN")' "$SUMMARY"
 
       - name: Diagnose tracked-tree state (post-wall)
-        if: always() && contains(github.event.inputs.suites, 'wall')
+        if: always() && contains(github.event.inputs.suites || 'wall,hygiene', 'wall')
         working-directory: src
         run: |
           set -uo pipefail
