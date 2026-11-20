@@ -141,6 +141,11 @@ jobs:
             cp .env.example .env
             # the sim-serve law: APP_URL must match the served origin
             sed -i 's#^APP_URL=.*#APP_URL=http://127.0.0.1:8080#' .env
+            # (OP-258b, the time-frozen context law) the freeze rides the .env:
+            # artisan serve strips non-passthrough vars from the serve children
+            # (ServeCommand::$passthroughVariables) so a step env alone never
+            # reaches the workers; phpdotenv loads this line in each worker.
+            echo 'MACRITION_FROZEN_HOUR=10' >> .env
             grep -q '^SESSION_SECURE_COOKIE=' .env && sed -i 's#^SESSION_SECURE_COOKIE=.*#SESSION_SECURE_COOKIE=false#' .env || echo 'SESSION_SECURE_COOKIE=false' >> .env
             touch database/database.sqlite
             php artisan key:generate --force
