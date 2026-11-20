@@ -153,6 +153,13 @@ jobs:
         working-directory: src
         env:
           TIER_A_BASE_URL: http://127.0.0.1:8080
+          # (OP-258b, the Tier-B time-frozen context law) the golden lane
+          # freezes the user's hour so the chrono card + the greeting word
+          # render ONE context on every run, any wall clock (the G-04/G-06
+          # wall-clock fragility of record — OP-258's finding). 10 = the
+          # morning context (the golden keys of record); the product surface
+          # is MACRITION_FROZEN_HOUR in PersonalizationEngine::userHour.
+          MACRITION_FROZEN_HOUR: '10'
           TIER_A_FIXTURE_EMAIL: tierb.member@macrition.test
           TIER_A_FIXTURE_PASSWORD: TierB-Golden-2026!
           TIER_A_ADMIN_EMAIL: tierb.admin@macrition.test
