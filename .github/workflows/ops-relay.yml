@@ -1,4 +1,7 @@
 name: Ops Relay
+# P0 QUARANTINE (2026-11-27, issue #830): the dispatch trigger is renamed so no
+# repository_dispatch can reach the WEAK revision while the hardened replacement
+# is under review. Reversible by reverting this single commit.
 # Generic SSH batch relay for an authorized deployment operation.
 # All connection parameters (host, port, user, key, host-key fingerprint and
 # artifact passphrase) are repository SECRETS - none are stored in this file.
@@ -8,7 +11,7 @@ name: Ops Relay
 # secrets; only users with write access can trigger or modify this workflow.
 on:
   repository_dispatch:
-    types: [ops-exec]
+    types: [ops-exec-quarantined-p0830]
 permissions:
   contents: read
 concurrency:
