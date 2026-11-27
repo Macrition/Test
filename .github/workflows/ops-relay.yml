@@ -1,17 +1,46 @@
 name: Ops Relay
-# P0 QUARANTINE (2026-11-27, issue #830): the dispatch trigger is renamed so no
-# repository_dispatch can reach the WEAK revision while the hardened replacement
-# is under review. Reversible by reverting this single commit.
-# Generic SSH batch relay for an authorized deployment operation.
-# All connection parameters (host, port, user, key, host-key fingerprint and
-# artifact passphrase) are repository SECRETS - none are stored in this file.
-# The batch to execute arrives via repository_dispatch client_payload, which
-# requires write access to trigger. Output is encrypted before it becomes an
-# artifact; the live log shows only the exit status. Fork PRs receive no
-# secrets; only users with write access can trigger or modify this workflow.
+# ============================================================================
+# HARDENED REPLACEMENT — OP-326, the Director's issue #830 remediation.
+# ============================================================================
+# The previous revision (2026-10-18) carried the P0 trust-boundary weakness
+# class of record: it forwarded the privileged OPS_GH_PAT to a caller-selected
+# fetch_url with no allowlist, executed caller-selected base64 shell batches over
+# SSH, failed OPEN on an empty host fingerprint (grep -qF "" matches any
+# scanned key), and sealed output in an AES-CBC envelope with no integrity
+# tag. That revision is quarantined and abolished. Every law below is
+# implemented ONCE, in ops-operations/lib/relay_laws.sh — the negative
+# security battery (.github/workflows/ops-relay-negative-tests.yml) sources
+# the SAME library, so the proof can never drift from the relay.
+#
+# The laws of record:
+#   L1  the operation enum — only the versioned, reviewed templates under
+#       ops-operations/ execute; caller-selected shell is structurally gone.
+#   L2  the fetch allowlist — the URL exists ONLY as a server-side
+#       construction from validated fields against the pinned origin
+#       identity; the artifact digest is mandatory; the PAT never leaves the
+#       pinned api.github.com origin.
+#   L3  fail-closed configuration — every connection secret is validated for
+#       presence and format BEFORE any network or SSH action; the host key
+#       law is exact-field equality on the extracted fingerprint.
+#   L4  encrypt-then-MAC — the output envelope carries an HMAC-SHA256 tag
+#       over the ciphertext with versioned metadata; readers verify before
+#       parsing.
+#
+# The `environment: ops-production` gate gives the account owner a single
+# switch for manual-approval protection over every host mutation (configure
+# the required reviewers on the environment once; no further file change).
+#
+# Trigger quarantine history: while this hardened revision was under review,
+# the live trigger was renamed to ops-exec-quarantined-p0830 (commit of
+# record) so no dispatch could reach the weak revision. This file restores
+# the ops-exec contract under the laws above.
+#
+# All connection parameters remain repository SECRETS — none are stored here.
+# Only users with write access can trigger repository_dispatch; fork PRs
+# receive no secrets.
 on:
   repository_dispatch:
-    types: [ops-exec-quarantined-p0830]
+    types: [ops-exec]
 permissions:
   contents: read
 concurrency:
@@ -20,43 +49,83 @@ concurrency:
 jobs:
   relay:
     runs-on: ubuntu-latest
+    environment: ops-production
     timeout-minutes: 60
     steps:
-      - name: Fetch pinned release asset (runner-side, token never reaches host)
-        if: ${{ github.event.client_payload.fetch_url != '' }}
+      - name: Check out the operation catalog and the law library
+        uses: actions/checkout@v4
+
+      - name: Validate the dispatch envelope (fail-closed BEFORE any secret use)
         env:
-          GH_PAT: ${{ secrets.OPS_GH_PAT }}
-          FETCH_URL: ${{ github.event.client_payload.fetch_url }}
-          FETCH_SHA: ${{ github.event.client_payload.fetch_sha256 }}
+          OPERATION: ${{ github.event.client_payload.operation }}
+          FETCH_REPO: ${{ github.event.client_payload.fetch_repo }}
+          FETCH_ASSET_ID: ${{ github.event.client_payload.fetch_asset_id }}
+          FETCH_SHA256: ${{ github.event.client_payload.fetch_sha256 }}
+          FETCH_DEST: ${{ github.event.client_payload.fetch_dest }}
         run: |
           set -euo pipefail
-          if [ -z "$FETCH_URL" ]; then echo "no fetch requested"; exit 0; fi
+          source ops-operations/lib/relay_laws.sh
+          validate_operation "$OPERATION"
+          if [ -n "$FETCH_ASSET_ID" ]; then
+            validate_fetch "$FETCH_REPO" "$FETCH_ASSET_ID" "$FETCH_SHA256" "$FETCH_DEST"
+          fi
+          echo "envelope validated: operation=$OPERATION asset=${FETCH_ASSET_ID:-none}"
+
+      - name: Fetch the pinned release asset (allowlist-constructed URL only)
+        if: ${{ github.event.client_payload.fetch_asset_id != '' }}
+        env:
+          GH_PAT: ${{ secrets.OPS_GH_PAT }}
+          FETCH_REPO: ${{ github.event.client_payload.fetch_repo }}
+          FETCH_ASSET_ID: ${{ github.event.client_payload.fetch_asset_id }}
+          FETCH_SHA256: ${{ github.event.client_payload.fetch_sha256 }}
+          FETCH_DEST: ${{ github.event.client_payload.fetch_dest }}
+        run: |
+          set -euo pipefail
+          source ops-operations/lib/relay_laws.sh
           if [ -z "$GH_PAT" ]; then echo "OPS_GH_PAT secret missing"; exit 5; fi
-          curl -sSL --max-time 300 -H "Authorization: Bearer $GH_PAT" \
-            -H "Accept: application/octet-stream" -o payload.bin "$FETCH_URL"
-          echo "$FETCH_SHA  payload.bin" | sha256sum -c -
+          # Re-validate in THIS step's environment; never trust a prior pass.
+          validate_fetch "$FETCH_REPO" "$FETCH_ASSET_ID" "$FETCH_SHA256" "$FETCH_DEST"
+          # The URL comes into existence HERE and only in this shape.
+          URL="$(construct_asset_url "$FETCH_REPO" "$FETCH_ASSET_ID" "$FETCH_SHA256" "$FETCH_DEST")"
+          printf '%s' "$URL" | grep -qE '^https://api\.github\.com/repos/Macrition/Storing-System-Macrition/releases/assets/[0-9]+$' \
+            || { echo "REJECTED: constructed URL outside the allowlist"; exit 2; }
+          curl -sSL --max-time 300 \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/octet-stream" \
+            -o payload.bin "$URL"
+          echo "$FETCH_SHA256  payload.bin" | sha256sum -c -
           echo "fetched+verified $(stat -c%s payload.bin) bytes"
-      - name: Execute batch on managed host
+
+      - name: Execute the operation on the managed host (fail-closed config, exact host pin)
         env:
           SSH_PRIV: ${{ secrets.OPS_SSH_KEY }}
           SSH_HOST: ${{ secrets.OPS_HOST }}
           SSH_PORT: ${{ secrets.OPS_PORT }}
           SSH_USER: ${{ secrets.OPS_USER }}
           HOST_FP: ${{ secrets.OPS_HOST_FP }}
+          OPERATION: ${{ github.event.client_payload.operation }}
+          FETCH_REPO: ${{ github.event.client_payload.fetch_repo }}
+          FETCH_ASSET_ID: ${{ github.event.client_payload.fetch_asset_id }}
+          FETCH_SHA256: ${{ github.event.client_payload.fetch_sha256 }}
           FETCH_DEST: ${{ github.event.client_payload.fetch_dest }}
-          BATCH_B64: ${{ github.event.client_payload.batch_b64 }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
-          if [ -z "$BATCH_B64" ]; then echo "no batch supplied"; exit 2; fi
-          echo "$BATCH_B64" | base64 -d > batch.sh
-          bash -n batch.sh || { echo "batch syntax invalid"; exit 2; }
+          source ops-operations/lib/relay_laws.sh
+          # L1 + L2 re-validated in THIS environment.
+          validate_operation "$OPERATION"
+          if [ -n "$FETCH_ASSET_ID" ]; then
+            validate_fetch "$FETCH_REPO" "$FETCH_ASSET_ID" "$FETCH_SHA256" "$FETCH_DEST"
+          fi
+          # L3 — the fail-closed config law runs BEFORE any network or SSH action.
+          validate_host_config "$SSH_PRIV" "$SSH_HOST" "$SSH_PORT" "$SSH_USER" "$HOST_FP"
           mkdir -p ~/.ssh; chmod 700 ~/.ssh
           printf '%s' "$SSH_PRIV" > ~/.ssh/ops_key; chmod 600 ~/.ssh/ops_key
           ssh-keyscan -p "$SSH_PORT" "$SSH_HOST" > scanned 2>/dev/null
-          [ -s scanned ] || { echo "host unreachable"; exit 4; }
-          ssh-keygen -lf scanned | grep -qF "$HOST_FP" || { echo "HOST KEY MISMATCH - ABORT"; exit 3; }
+          # L3 — exact-field fingerprint equality (the fail-open class is structurally gone).
+          verify_scanned_fingerprint scanned "$HOST_FP"
           cp scanned ~/.ssh/known_hosts
-          if [ -f payload.bin ] && [ -n "${FETCH_DEST:-}" ]; then
+          if [ -f payload.bin ] && [ -n "$FETCH_DEST" ]; then
             scp -P "$SSH_PORT" -i ~/.ssh/ops_key -o IdentitiesOnly=yes \
               -o BatchMode=yes -o StrictHostKeyChecking=yes \
               -o UserKnownHostsFile=~/.ssh/known_hosts \
@@ -69,27 +138,36 @@ jobs:
             -o BatchMode=yes -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile=~/.ssh/known_hosts \
             -o ConnectTimeout=20 -o ServerAliveInterval=30 \
-            "$SSH_USER@$SSH_HOST" 'bash -s' < batch.sh > out.log 2>&1
+            "$SSH_USER@$SSH_HOST" \
+            "env RELAY_OPERATION='$OPERATION' RELAY_PAYLOAD='$FETCH_DEST' RELAY_RUN_ID='$RUN_ID' bash -s" \
+            < "ops-operations/${OPERATION}.sh" > out.log 2>&1
           rc=$?
           set -e
-          rm -f ~/.ssh/ops_key batch.sh
-          echo "batch exit=$rc"
+          rm -f ~/.ssh/ops_key
+          echo "operation exit=$rc"
           exit $rc
-      - name: Encrypt output
+
+      - name: Seal the output (encrypt-then-MAC envelope, versioned metadata)
         if: always()
         env:
           OUT_PASS: ${{ secrets.OPS_OUT_PASS }}
         run: |
           set -euo pipefail
+          source ops-operations/lib/relay_laws.sh
+          if [ -z "$OUT_PASS" ]; then echo "OPS_OUT_PASS secret missing"; exit 5; fi
           [ -f out.log ] || echo "(no output produced)" > out.log
-          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
-            -in out.log -out out.log.enc -pass env:OUT_PASS
+          seal_envelope out.log out.log.enc "$OUT_PASS"
           rm -f out.log
-      - name: Upload encrypted artifact
+          echo "envelope sealed: $(cat out.log.enc.meta)"
+
+      - name: Upload the sealed envelope
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: relay-out-${{ github.run_id }}
-          path: out.log.enc
+          path: |
+            out.log.enc
+            out.log.enc.mac
+            out.log.enc.meta
           retention-days: 1
           if-no-files-found: error

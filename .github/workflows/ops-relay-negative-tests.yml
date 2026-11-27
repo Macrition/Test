@@ -1,0 +1,51 @@
+name: Ops Relay Negative Security Battery
+# ============================================================================
+# OP-326 — the negative security battery of record (issue #830).
+# OP-327 widened it: the static + envelope suites also prove the four sibling
+# relay envelopes (test/tier-a/tier-b/db) ride the SAME L4 law — per-file
+# structural laws + per-shape runtime arms (seal, verify, tamper-refusal,
+# wrong-key refusal, verify-then-decrypt byte-exactness).
+# ============================================================================
+# Proves that caller-controlled URLs, caller-selected shell, missing or
+# malformed configuration, and tampered output envelopes are REJECTED — using
+# the SAME law library the relay executes, with run-time generated and masked
+# fixture credentials, a localhost mock listener, and documentation-range
+# addresses. This battery NEVER touches a production host, never sends a real
+# secret anywhere, and runs ONLY on workflow_dispatch (it cannot be triggered
+# by repository_dispatch, so no external actor can aim it).
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: 'static | runtime | envelope | all'
+        required: false
+        default: 'all'
+permissions: {}
+concurrency:
+  group: ops-relay-negative-tests
+  cancel-in-progress: false
+jobs:
+  battery:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the law library, the operation catalog and the battery
+        uses: actions/checkout@v4
+
+      - name: Static law battery (the workflow file's structural laws)
+        if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'static' }}
+        run: bash ops-operations/tests/static_laws.sh < /dev/null
+
+      - name: Runtime rejection battery (localhost mock, zero external contact)
+        if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'runtime' }}
+        run: bash ops-operations/tests/runtime_arms.sh < /dev/null
+
+      - name: Envelope integrity battery (run-time fixture passphrase, masked)
+        if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'envelope' }}
+        run: bash ops-operations/tests/envelope_tamper.sh < /dev/null
+
+      - name: The battery verdict of record
+        if: always()
+        run: |
+          echo "suite=${{ github.event.inputs.suite }} run=${{ github.run_id }}"
+          echo "The negative security battery of record is GREEN only when every arm above printed PASS."
