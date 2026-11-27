@@ -1,6 +1,10 @@
 name: Ops Relay Negative Security Battery
 # ============================================================================
 # OP-326 — the negative security battery of record (issue #830).
+# OP-327 widened it: the static + envelope suites also prove the four sibling
+# relay envelopes (test/tier-a/tier-b/db) ride the SAME L4 law — per-file
+# structural laws + per-shape runtime arms (seal, verify, tamper-refusal,
+# wrong-key refusal, verify-then-decrypt byte-exactness).
 # ============================================================================
 # Proves that caller-controlled URLs, caller-selected shell, missing or
 # malformed configuration, and tampered output envelopes are REJECTED — using
@@ -30,15 +34,15 @@ jobs:
 
       - name: Static law battery (the workflow file's structural laws)
         if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'static' }}
-        run: bash ops-operations/tests/static_laws.sh
+        run: bash ops-operations/tests/static_laws.sh < /dev/null
 
       - name: Runtime rejection battery (localhost mock, zero external contact)
         if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'runtime' }}
-        run: bash ops-operations/tests/runtime_arms.sh
+        run: bash ops-operations/tests/runtime_arms.sh < /dev/null
 
       - name: Envelope integrity battery (run-time fixture passphrase, masked)
         if: ${{ github.event.inputs.suite == 'all' || github.event.inputs.suite == 'envelope' }}
-        run: bash ops-operations/tests/envelope_tamper.sh
+        run: bash ops-operations/tests/envelope_tamper.sh < /dev/null
 
       - name: The battery verdict of record
         if: always()

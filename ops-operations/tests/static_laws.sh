@@ -53,6 +53,21 @@ check_present "grep -qE '^SHA256:[A-Za-z0-9+/]{43}=\$'" "$LIB" "L3: the fingerpr
 check_present "hmac-sha256-encrypt-then-mac" "$LIB" "L4: the encrypt-then-MAC envelope of record"
 check_present "envelope_version" "$LIB" "L4: versioned envelope metadata"
 
+echo "== static law battery: the four sibling relay envelopes (the OP-327 widening) =="
+# The widening rolls the ONE L4 law onto test/tier-a/tier-b/db relays: each
+# file sources the law library, wires seal_envelope, checks out the law
+# library before the lane, uploads the MAC + metadata sidecars, and carries
+# NO bare unauthenticated CBC construction of its own.
+for wf in test-relay tier-a-relay tier-b-relay db-relay; do
+    F=".github/workflows/${wf}.yml"
+    check_present "ops-operations/lib/relay_laws.sh" "$F" "widening ${wf}: the envelope law library is sourced"
+    check_present "seal_envelope" "$F" "widening ${wf}: the encrypt-then-MAC seal is wired"
+    check_present "Check out the law library" "$F" "widening ${wf}: the law-library self-checkout precedes the lane"
+    check_present ".enc.mac" "$F" "widening ${wf}: the MAC sidecar rides the uploaded artifact"
+    check_present ".enc.meta" "$F" "widening ${wf}: the versioned metadata sidecar rides the uploaded artifact"
+    check_absent "openssl enc -aes-256-cbc" "$F" "widening ${wf}: the bare unauthenticated CBC construction is abolished"
+done
+
 if [ "$FAIL" -ne 0 ]; then
     echo "== STATIC LAW BATTERY: FAIL =="
     exit 1

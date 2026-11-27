@@ -16,9 +16,18 @@ name: Test Relay
 #      and aggregate counts. Every step whose output could embed
 #      private-derived metadata (composer, artisan, phpunit detail) is
 #      redirected into detail logs that are never printed.
-#   3. Detailed evidence (full logs + JUnit) is AES-256-encrypted with a
-#      passphrase secret before upload; the artifact is decryptable
-#      only by the secret holder.
+#   3. Detailed evidence (full logs + JUnit) rides the L4 encrypt-then-MAC
+#      envelope of record (the OP-327 widening of issue #830): sealed through
+#      ops-operations/lib/relay_laws.sh seal_envelope — AES-256-CBC + PBKDF2
+#      (200k iterations), then HMAC-SHA256 over the CIPHERTEXT with versioned
+#      metadata. The reader verifies the MAC before any parse (verify_envelope;
+#      a tampered envelope is refused, exit 6) — the bare unauthenticated CBC
+#      construction is abolished. The artifact is sealed by and decryptable
+#      only by the secret holder. Owner verify-then-decrypt:
+#        source ops-operations/lib/relay_laws.sh
+#        verify_envelope evidence.tgz.enc evidence.tgz.enc.mac "$RELAY_PASS"
+#        RELAY_PASS="$RELAY_PASS" openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+#          -in evidence.tgz.enc -out evidence.tgz -pass env:RELAY_PASS
 #
 # TRIGGER SURFACE: workflow_dispatch ONLY — collaborators only (forks
 # and anonymous users can neither dispatch nor read secrets).
@@ -76,6 +85,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 110
     steps:
+      - name: Check out the law library (the L4 envelope law of record — the OP-327 widening)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
       - name: Resolve target SHA
         env:
           GH_PAT: ${{ secrets.OPS_GH_PAT }}
@@ -338,6 +350,7 @@ jobs:
           RELAY_PASS: ${{ secrets.TEST_RELAY_PASS }}
         run: |
           set -euo pipefail
+          source ops-operations/lib/relay_laws.sh
           [ -f detail-install.log ] || : > detail-install.log
           [ -f detail-boot.log ] || : > detail-boot.log
           [ -f detail-hygiene.log ] || : > detail-hygiene.log
@@ -353,7 +366,12 @@ jobs:
             cp "${RUNNER_TEMP:-/tmp}/hosted-junit"/*.junit.xml junit-receipts/ 2>/dev/null || true
           fi
           tar czf evidence.tgz detail-install.log detail-boot.log detail-hygiene.log detail-wall.log detail-gitstatus.log wall-summary.json junit-receipts
-          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -in evidence.tgz -out "$GITHUB_WORKSPACE/evidence.tgz.enc" -pass env:RELAY_PASS
+          # OP-327 widening (issue #830 follow-up): the envelope law of record —
+          # seal_envelope encrypts (AES-256-CBC + PBKDF2 200k) AND seals the
+          # HMAC-SHA256 integrity tag + versioned metadata beside the ciphertext
+          # (encrypt-then-MAC; verify-before-parse on the reader side). The bare
+          # unauthenticated CBC construction is abolished from this file.
+          seal_envelope evidence.tgz "$GITHUB_WORKSPACE/evidence.tgz.enc" "$RELAY_PASS"
           rm -f evidence.tgz detail-*.log wall-summary.json; rm -rf junit-receipts
 
       - name: Upload encrypted artifact
@@ -361,7 +379,10 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: test-relay-${{ github.run_id }}-attempt-${{ github.run_attempt }}
-          path: evidence.tgz.enc
+          path: |
+            evidence.tgz.enc
+            evidence.tgz.enc.mac
+            evidence.tgz.enc.meta
           retention-days: 30
           if-no-files-found: error
 

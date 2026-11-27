@@ -31,3 +31,30 @@ and the connection configuration have passed the fail-closed validation.
 The old contract (`fetch_url`, `batch_b64`) does not exist anymore: a caller
 sending it fails the envelope validation before any secret is read, before any
 request is made, and before any host is contacted.
+
+## The evidence-envelope law (the OP-327 widening, issue #830 follow-up)
+
+ALL FIVE relay workflows now seal their evidence through the ONE law library:
+`seal_envelope` encrypts (AES-256-CBC + PBKDF2, 200,000 iterations) AND seals
+an HMAC-SHA256 integrity tag over the ciphertext plus versioned metadata
+(`op326-etm-v1`). `test-relay` / `tier-a-relay` / `tier-b-relay` / `db-relay`
+previously sealed with a bare unauthenticated `openssl enc -aes-256-cbc`
+construction (tier-a even omitted the 200k KDF parameter its siblings carried)
+— that class is abolished: each relay file now sources `lib/relay_laws.sh`,
+checks out the law library as its first step, seals through `seal_envelope`,
+and uploads the `.enc.mac` + `.enc.meta` sidecars beside the ciphertext. The
+widened static + envelope batteries prove the law per file and per artifact
+shape (the `wid-*` arms), so the proof cannot drift from the relay.
+
+The owner verify-then-decrypt (each relay's header documents its exact names):
+
+    source ops-operations/lib/relay_laws.sh
+    verify_envelope <artifact>.enc <artifact>.enc.mac "$RELAY_PASS"
+    RELAY_PASS="$RELAY_PASS" openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+      -in <artifact>.enc -out <artifact>.tgz -pass env:RELAY_PASS
+
+A tampered envelope is REFUSED (exit 6) before any parse. The hosted re-proof
+of the widened arms rides `ops-relay-negative-tests.yml` (workflow_dispatch)
+once the hardening branches are merged to the default branch — the workflow
+file must exist on the default branch for the dispatch surface to exist, so
+hosted execution is merge-gated (the standing OP-326 disclosure).
