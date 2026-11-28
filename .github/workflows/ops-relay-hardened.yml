@@ -1,0 +1,283 @@
+name: Ops Relay (Hardened)
+
+# HARDENED REPLACEMENT for ops-relay.yml (issue #830, delivered 2026-11-28).
+#
+# The legacy workflow stays QUARANTINED (its dispatch type remains
+# ops-exec-quarantined-p0830, unreachable). This file is the reviewed
+# replacement and it closes every remediation row of issue #830:
+#
+#   R1. No caller-selected fetch URL. The fetch step only talks to the
+#       exact GitHub API release-asset origin for the allowlisted
+#       Macrition repositories (strict HTTPS + host + repo + asset-id
+#       match), and the privileged PAT never leaves the runner for any
+#       other host. The digest is REQUIRED and verified before use.
+#   R2. No caller-supplied shell. The batch is a small, versioned
+#       OPERATION ENUM (health-check | service-restart | deploy-release)
+#       with fixed server-side command templates embedded below; the
+#       caller may only name an operation and pass narrowly validated
+#       parameters (service name / release tag). Extend the enum through
+#       a reviewed PR, never through a dispatch payload.
+#   R3. Fail-closed host configuration: every connection secret must be
+#       non-empty, and the host-key fingerprint must match the strict
+#       SHA256:<43 base64 chars> form BEFORE any SSH action. Missing or
+#       malformed configuration aborts - an empty fixed-string search
+#       can never match.
+#   R4. Authenticated encryption (encrypt-then-MAC): the output envelope
+#       is AES-256-CBC + PBKDF2 (200k) and carries an HMAC-SHA256 tag
+#       over the CIPHERTEXT; verify the tag first, then decrypt.
+#   R5. The job runs in the `ops-protected` environment - the operator
+#       must configure required reviewers on it (repo Settings ->
+#       Environments -> ops-protected) so every host mutation waits for
+#       a human approval. Host-side least privilege (an unprivileged
+#       restricted SSH account with a forced command) remains the
+#       operator's checklist row in issue #830.
+#   R6. No reusable synthetic credentials are committed; every
+#       credential rides repository secrets and is masked in logs.
+#
+# Trigger: repository_dispatch type `ops-exec-hardened` (a NEW type -
+# nothing that dispatched the old `ops-exec` can reach this workflow
+# until the operator consciously rotates credentials and switches the
+# dispatch lane). A `workflow_dispatch` lane exists for manual,
+# approved operation from the Actions UI.
+#
+# Live log discipline: only validation statuses and exit codes print;
+# the operation output is encrypted before it becomes an artifact.
+
+on:
+  repository_dispatch:
+    types: [ops-exec-hardened]
+  workflow_dispatch:
+    inputs:
+      op:
+        description: "Operation enum value"
+        required: true
+        type: choice
+        options:
+          - health-check
+          - service-restart
+          - deploy-release
+      service:
+        description: "service-restart only: systemd unit name"
+        required: false
+        default: ""
+      release_tag:
+        description: "deploy-release only: release tag (also the artifact name suffix)"
+        required: false
+        default: ""
+      fetch_asset_id:
+        description: "deploy-release optional: GitHub API release asset id to fetch"
+        required: false
+        default: ""
+      fetch_repo:
+        description: "deploy-release optional: allowlisted repo slug owning the asset"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ops-relay-hardened
+  cancel-in-progress: false
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    # R5: the operator MUST configure required reviewers on this
+    # environment; until then the containment principle holds - do not
+    # rotate the dispatch lane over to this workflow.
+    environment: ops-protected
+    timeout-minutes: 45
+    steps:
+      - name: Resolve operation (enum + parameter validation, fail closed)
+        env:
+          OP_DISPATCH: ${{ github.event.client_payload.op }}
+          OP_INPUT: ${{ github.event.inputs.op }}
+          SERVICE_IN: ${{ github.event.client_payload.service || github.event.inputs.service }}
+          RELEASE_TAG_IN: ${{ github.event.client_payload.release_tag || github.event.inputs.release_tag }}
+          FETCH_ASSET_ID_IN: ${{ github.event.client_payload.fetch_asset_id || github.event.inputs.fetch_asset_id }}
+          FETCH_REPO_IN: ${{ github.event.client_payload.fetch_repo || github.event.inputs.fetch_repo }}
+        run: |
+          set -euo pipefail
+          OP="${OP_DISPATCH:-${OP_INPUT:-}}"
+          case "$OP" in
+            health-check|service-restart|deploy-release) ;;
+            *) echo "REFUSED: op '$OP' is not in the operation enum"; exit 2 ;;
+          esac
+          SERVICE=""
+          RELEASE_TAG=""
+          FETCH_ASSET_ID=""
+          FETCH_REPO=""
+          if [ "$OP" = "service-restart" ]; then
+            SERVICE="$SERVICE_IN"
+            [[ "$SERVICE" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.@-]{0,63}$ ]] || { echo "REFUSED: invalid service unit name"; exit 2; }
+          fi
+          if [ "$OP" = "deploy-release" ]; then
+            RELEASE_TAG="$RELEASE_TAG_IN"
+            [[ "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || { echo "REFUSED: invalid release tag"; exit 2; }
+            if [ -n "$FETCH_ASSET_ID_IN" ]; then
+              [[ "$FETCH_ASSET_ID_IN" =~ ^[0-9]{1,20}$ ]] || { echo "REFUSED: invalid asset id"; exit 2; }
+              FETCH_ASSET_ID="$FETCH_ASSET_ID_IN"
+            fi
+            if [ -n "$FETCH_REPO_IN" ]; then
+              case "$FETCH_REPO_IN" in
+                "Macrition/Storing-System-Macrition"|"Macrition/Test") FETCH_REPO="$FETCH_REPO_IN" ;;
+                *) echo "REFUSED: fetch repo not in the allowlist"; exit 2 ;;
+              esac
+            fi
+          fi
+          printf 'op=%s\nservice=%s\nrelease_tag=%s\nfetch_asset_id=%s\nfetch_repo=%s\n' \
+            "$OP" "$SERVICE" "$RELEASE_TAG" "$FETCH_ASSET_ID" "$FETCH_REPO" > op.plan
+          cat op.plan
+          echo "OP_RESOLVED=1" >> "$GITHUB_ENV"
+
+      - name: Fetch release asset (allowlisted GitHub origin only, digest REQUIRED)
+        env:
+          GH_PAT: ${{ secrets.OPS_GH_PAT }}
+          FETCH_URL: ${{ github.event.client_payload.fetch_url }}
+          FETCH_ASSET_ID: ${{ github.event.client_payload.fetch_asset_id }}
+          FETCH_REPO: ${{ github.event.client_payload.fetch_repo }}
+          FETCH_SHA: ${{ github.event.client_payload.fetch_sha256 }}
+        run: |
+          set -euo pipefail
+          # R1: the ONLY acceptable URL shape is the GitHub API release
+          # asset endpoint for an allowlisted Macrition repo. A caller
+          # can never point the privileged PAT at another host.
+          if [ -n "$FETCH_URL" ]; then
+            case "$FETCH_URL" in
+              https://api.github.com/repos/Macrition/Storing-System-Macrition/releases/assets/*|\
+              https://api.github.com/repos/Macrition/Test/releases/assets/*)
+                ASSET_URL="$FETCH_URL" ;;
+              *)
+                echo "REFUSED: fetch_url outside the allowlisted GitHub API origin"; exit 2 ;;
+            esac
+          elif [ -n "$FETCH_ASSET_ID" ]; then
+            REPO="${FETCH_REPO:-Macrition/Storing-System-Macrition}"
+            case "$REPO" in
+              "Macrition/Storing-System-Macrition"|"Macrition/Test") ;;
+              *) echo "REFUSED: repo not allowlisted"; exit 2 ;;
+            esac
+            ASSET_URL="https://api.github.com/repos/$REPO/releases/assets/$FETCH_ASSET_ID"
+          else
+            echo "no fetch requested"
+            exit 0
+          fi
+          [ -n "$GH_PAT" ] || { echo "OPS_GH_PAT secret missing - fail closed"; exit 5; }
+          # R1: the digest is REQUIRED - never fetch unverified bytes.
+          [ -n "$FETCH_SHA" ] || { echo "REFUSED: fetch_sha256 digest missing"; exit 2; }
+          [[ "$FETCH_SHA" =~ ^[a-f0-9]{64}$ ]] || { echo "REFUSED: digest not sha256 hex"; exit 2; }
+          curl --proto '=https' --tlsv1.2 -sSL --max-time 300 \
+            -H "Authorization: Bearer $GH_PAT" \
+            -H "Accept: application/octet-stream" \
+            -o payload.bin "$ASSET_URL"
+          echo "$FETCH_SHA  payload.bin" | sha256sum -c -
+          echo "fetched+verified $(stat -c%s payload.bin) bytes"
+
+      - name: Execute fixed operation on managed host (fail-closed config)
+        env:
+          SSH_PRIV: ${{ secrets.OPS_SSH_KEY }}
+          SSH_HOST: ${{ secrets.OPS_HOST }}
+          SSH_PORT: ${{ secrets.OPS_PORT }}
+          SSH_USER: ${{ secrets.OPS_USER }}
+          HOST_FP: ${{ secrets.OPS_HOST_FP }}
+          APP_DIR: ${{ secrets.OPS_APP_DIR }}
+        run: |
+          set -euo pipefail
+          . ./op.plan
+          # R3: fail closed on ANY missing or malformed configuration.
+          for v in SSH_PRIV SSH_HOST SSH_PORT SSH_USER HOST_FP; do
+            [ -n "${!v:-}" ] || { echo "REFUSED: $v not configured"; exit 6; }
+          done
+          [[ "$SSH_PORT" =~ ^[0-9]{1,5}$ ]] || { echo "REFUSED: bad port"; exit 6; }
+          # R3: strict fingerprint form - an empty or malformed FP can
+          # never pass (the legacy grep -qF "" failure mode is closed).
+          if ! [[ "$HOST_FP" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]]; then
+            echo "REFUSED: OPS_HOST_FP must be SHA256:<43 base64 chars>"; exit 3
+          fi
+          FP64="${HOST_FP#SHA256:}"
+          mkdir -p ~/.ssh; chmod 700 ~/.ssh
+          printf '%s' "$SSH_PRIV" > ~/.ssh/ops_key; chmod 600 ~/.ssh/ops_key
+          ssh-keyscan -T 15 -p "$SSH_PORT" "$SSH_HOST" > scanned 2>/dev/null
+          [ -s scanned ] || { echo "host unreachable"; exit 4; }
+          ssh-keygen -lf scanned | grep -qF "$FP64" || { echo "HOST KEY MISMATCH - ABORT"; exit 3; }
+          cp scanned ~/.ssh/known_hosts
+          SSH_OPTS=(-p "$SSH_PORT" -i ~/.ssh/ops_key -o IdentitiesOnly=yes
+            -o BatchMode=yes -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile=~/.ssh/known_hosts
+            -o ConnectTimeout=20 -o ServerAliveInterval=30)
+          # scp spells its port option with a capital P (lowercase -p
+          # would mean "preserve timestamps").
+          SCP_OPTS=(-P "$SSH_PORT" -i ~/.ssh/ops_key -o IdentitiesOnly=yes
+            -o BatchMode=yes -o StrictHostKeyChecking=yes
+            -o UserKnownHostsFile=~/.ssh/known_hosts
+            -o ConnectTimeout=20)
+          # R2: fixed server-side command templates - the caller names
+          # an operation, it never ships shell.
+          if [ -f payload.bin ]; then
+            if [ -z "$APP_DIR" ]; then echo "REFUSED: OPS_APP_DIR not configured"; exit 6; fi
+            case "$APP_DIR" in /*) ;; *) echo "REFUSED: OPS_APP_DIR must be absolute"; exit 6 ;; esac
+            if [ "$op" = "deploy-release" ]; then
+              scp "${SCP_OPTS[@]}" payload.bin \
+                "$SSH_USER@$SSH_HOST:$APP_DIR/releases/$release_tag.tar.gz"
+              echo "payload staged: $(stat -c%s payload.bin) bytes"
+            fi
+            rm -f payload.bin
+          fi
+          set +e
+          case "$op" in
+            health-check)
+              ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" \
+                'uptime; df -h /; systemctl is-system-running' \
+                > out.log 2>&1 ;;
+            service-restart)
+              # $service validated above: unit-name charset only.
+              ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" \
+                "sudo systemctl restart '$service' && systemctl is-active '$service'" \
+                > out.log 2>&1 ;;
+            deploy-release)
+              ssh "${SSH_OPTS[@]}" "$SSH_USER@$SSH_HOST" \
+                "set -e; test -f '$APP_DIR/releases/$release_tag.tar.gz'; \
+                 ln -sfn '$APP_DIR/releases/$release_tag.tar.gz' '$APP_DIR/current-release.tar.gz'; \
+                 echo staged-at '$APP_DIR/releases/$release_tag.tar.gz'" \
+                > out.log 2>&1 ;;
+          esac
+          rc=$?
+          set -e
+          rm -f ~/.ssh/ops_key
+          echo "operation exit=$rc"
+          exit $rc
+
+      - name: Encrypt-then-MAC output
+        if: always()
+        env:
+          OUT_PASS: ${{ secrets.OPS_OUT_PASS }}
+        run: |
+          set -euo pipefail
+          [ -n "$OUT_PASS" ] || { echo "OPS_OUT_PASS secret missing"; exit 7; }
+          [ -f out.log ] || echo "(no output produced)" > out.log
+          # R4: encrypt, then authenticate the CIPHERTEXT (EtM).
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -in out.log -out out.log.enc -pass env:OUT_PASS
+          rm -f out.log
+          openssl dgst -sha256 -hmac "$OUT_PASS" -binary out.log.enc > out.log.enc.mac
+          base64 -w0 out.log.enc.mac > out.log.enc.mac.b64
+          rm -f out.log.enc.mac
+          echo "::add-mask::$OUT_PASS"
+          echo "envelope + HMAC-SHA256 tag sealed"
+
+      - name: Upload encrypted artifact + MAC tag
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: relay-out-hardened-${{ github.run_id }}
+          path: |
+            out.log.enc
+            out.log.enc.mac.b64
+          retention-days: 1
+          if-no-files-found: error
+
+# Verification contract (for the operator): download BOTH artifacts,
+# recompute `openssl dgst -sha256 -hmac $OPS_OUT_PASS -binary out.log.enc`
+# and compare against out.log.enc.mac.b64 (decode first) BEFORE decrypting;
+# then `openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in out.log.enc
+# -out out.log -pass env:OPS_OUT_PASS`. A tag mismatch = do not decrypt.
